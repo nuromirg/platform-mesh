@@ -20,6 +20,9 @@ import (
 	"context"
 	"fmt"
 
+	"slices"
+	"strings"
+
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -64,15 +67,15 @@ func (s *storeSubroutine) Finalize(ctx context.Context, obj ctrlruntimeclient.Ob
 		return subroutines.OK(), nil
 	}
 
-	authorizationModels, err := getRelatedAuthorizationModels(ctx, s.kcpHelper, store)
-	if err != nil {
-		return subroutines.OK(), err
-	}
-	if len(authorizationModels.Items) != 0 {
-		return subroutines.OK(), fmt.Errorf("found non-zero count of depending authorization models")
+	// Block deletion while any AuthorizationModel still depends on this
+	// Store, tracked via finalizers instead of a list to avoid stale reads.
+	for _, f := range store.GetFinalizers() {
+		if strings.HasPrefix(f, authorizationModelFinalizerPrefix) {
+			return subroutines.OK(), fmt.Errorf("waiting for dependent authorization model to be removed: %s", f)
+		}
 	}
 
-	_, err = s.fga.DeleteStore(ctx, &openfgav1.DeleteStoreRequest{StoreId: store.Status.StoreID})
+	_, err := s.fga.DeleteStore(ctx, &openfgav1.DeleteStoreRequest{StoreId: store.Status.StoreID})
 	if status, ok := status.FromError(err); ok && status.Code() == codes.Code(openfgav1.NotFoundErrorCode_store_id_not_found) {
 		return subroutines.OK(), nil
 	}
@@ -114,6 +117,16 @@ func (s *storeSubroutine) Process(ctx context.Context, obj ctrlruntimeclient.Obj
 	}
 
 	fgaStore, err := s.fga.GetStore(ctx, &openfgav1.GetStoreRequest{StoreId: store.Status.StoreID})
+	if status.Code(err) == codes.Code(openfgav1.NotFoundErrorCode_store_id_not_found) {
+		log.Info().Msg("Store ID not found, recreating store")
+		res, err := s.fga.CreateStore(ctx, &openfgav1.CreateStoreRequest{Name: store.Name})
+		if err != nil {
+			return subroutines.OK(), err
+		}
+		store.Status.StoreID = res.GetId()
+		store.Status.AuthorizationModelID = ""
+		return subroutines.OK(), nil
+	}
 	if err != nil {
 		return subroutines.OK(), err
 	}

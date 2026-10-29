@@ -115,6 +115,40 @@ go run main.go gateway --schema-handler grpc --enable-playground
 
 The helper script [`hack/create-clusteraccess.sh`](hack/create-clusteraccess.md) can automate ClusterAccess resource creation.
 
+#### Restrict typed resource operations
+
+By default, a `ClusterAccess` exposes typed GraphQL operations for every
+resource discovered on the target cluster. Use `schemaFilter` to expose only
+selected Kubernetes API groups, versions, and resources:
+
+```yaml
+apiVersion: gateway.platform-mesh.io/v1alpha1
+kind: ClusterAccess
+metadata:
+  name: my-cluster
+spec:
+  host: https://<cluster-api-server>
+  schemaFilter:
+    include:
+      # The empty group selects the Kubernetes core API group.
+      - group: ""
+        version: v1
+        resource: pods
+      # Omitting version selects all versions of the deployments resource.
+      - group: apps
+        resource: deployments
+```
+
+The include selectors are ORed and matched exactly, including case. `group` is
+required; `version` and `resource` are optional. Resource names use the
+lowercase, plural names reported by Kubernetes API discovery. Omitting
+`schemaFilter` preserves the default behavior of exposing every discovered
+resource type.
+
+The filter controls generated typed GraphQL operations and introspection. It is
+not an authorization boundary: Kubernetes RBAC remains authoritative, and
+generic operations such as `applyYaml` are not restricted by `schemaFilter`.
+
 ## GraphQL API
 
 For every Kubernetes resource discovered on a cluster, the gateway generates typed GraphQL operations:
@@ -174,6 +208,34 @@ The `ClusterAccess` CRD supports four authentication methods (mutually exclusive
 
 Optionally set `ca.secretRef` for custom CA certificates.
 
+### Trusted ServiceAccount Requests
+
+By default, every GraphQL request requires an end-user bearer token. The
+gateway validates it with Kubernetes TokenReview and forwards that identity to
+the target API server.
+
+For endpoints protected by an external trust boundary such as mTLS at the
+ingress or service mesh, a `ClusterAccess` can explicitly use its configured
+ServiceAccount for every request:
+
+```yaml
+spec:
+  requestIdentityMode: serviceAccount
+  auth:
+    serviceAccountRef:
+      name: graphql-gateway
+      namespace: graphql-gateway
+```
+
+In this mode, requests do not need an `Authorization` header, TokenReview is
+skipped, and a caller-supplied bearer token never changes the Kubernetes
+identity. Kubernetes RBAC on the ServiceAccount authorizes queries, mutations,
+and subscriptions. Keep its permissions least-privileged and expose this
+endpoint only behind the external trust boundary; the gateway does not
+establish or verify that boundary.
+
+See `config/examples/clusteraccess-serviceaccount.yaml` for a read-only example.
+
 ## Configuration Reference
 
 ### Gateway Flags
@@ -201,6 +263,8 @@ Optionally set `ca.secretRef` for custom CA certificates.
 | `--max-query-batch-size` | `10` | Max queries per batch request |
 | `--read-header-timeout` | `32s` | Max duration for reading request headers |
 | `--idle-timeout` | `90s` | Max idle duration for keep-alive connections |
+| `--kubernetes-qps` | `0` (uses client-go default: 5) | Max requests per second to the Kubernetes API server |
+| `--kubernetes-burst` | `0` (uses client-go default: 10) | Max burst size for requests to the Kubernetes API server |
 
 Set any limit flag to `0` to disable that limit.
 

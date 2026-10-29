@@ -23,43 +23,45 @@ import (
 	"crypto/tls"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jarcoal/httpmock"
-	"github.com/kcp-dev/multicluster-provider/apiexport"
+	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
+
+	"go.platform-mesh.io/apis/ui/v1alpha1"
+	"go.platform-mesh.io/extension-manager-operator/internal/config"
+	commonTesting "go.platform-mesh.io/extension-manager-operator/pkg/util/testing"
+	"go.platform-mesh.io/extension-manager-operator/pkg/validation/validation_test"
 	platformmeshconfig "go.platform-mesh.io/golang-commons/config"
 	"go.platform-mesh.io/golang-commons/logger"
-	"golang.org/x/sync/errgroup"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 	"sigs.k8s.io/yaml"
 
 	"github.com/kcp-dev/logicalcluster/v3"
+	"github.com/kcp-dev/multicluster-provider/apiexport"
 	clusterclient "github.com/kcp-dev/multicluster-provider/client"
 	"github.com/kcp-dev/multicluster-provider/envtest"
 	apisv1alpha1 "github.com/kcp-dev/sdk/apis/apis/v1alpha1"
 	"github.com/kcp-dev/sdk/apis/core"
 	tenancyv1alpha1 "github.com/kcp-dev/sdk/apis/tenancy/v1alpha1"
 	topologyv1alpha1 "github.com/kcp-dev/sdk/apis/topology/v1alpha1"
-	"github.com/stretchr/testify/require"
-	"github.com/stretchr/testify/suite"
-
-	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/rest"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
-
-	"go.platform-mesh.io/apis/ui/v1alpha1"
-	"go.platform-mesh.io/extension-manager-operator/internal/config"
-	commonTesting "go.platform-mesh.io/extension-manager-operator/pkg/util/testing"
-	"go.platform-mesh.io/extension-manager-operator/pkg/validation/validation_test"
 )
 
 const (
@@ -67,19 +69,11 @@ const (
 	defaultTickInterval = 250 * time.Millisecond
 )
 
-var (
-	env       *envtest.Environment
-	kcpConfig *rest.Config
-)
-
 type ContentConfigurationTestSuite struct {
 	suite.Suite
 	cli                clusterclient.ClusterClient
 	provider, consumer logicalcluster.Path
 	consumerWS         *tenancyv1alpha1.Workspace
-	ctx                context.Context
-	cancel             context.CancelFunc
-	g                  *errgroup.Group
 }
 
 func init() {
@@ -87,7 +81,6 @@ func init() {
 	runtime.Must(apisv1alpha1.AddToScheme(scheme.Scheme))
 	runtime.Must(tenancyv1alpha1.AddToScheme(scheme.Scheme))
 	runtime.Must(topologyv1alpha1.AddToScheme(scheme.Scheme))
-
 }
 
 func (suite *ContentConfigurationTestSuite) SetupSuite() {
@@ -97,18 +90,36 @@ func (suite *ContentConfigurationTestSuite) SetupSuite() {
 	log, err := logger.New(logConfig)
 	ctrl.SetLogger(log.Logr())
 	suite.Require().NoError(err, "failed to create logger %v", err)
-	suite.ctx, suite.cancel = context.WithCancel(context.Background())
+
+	// Do not use T.Context() because that context would be cancelled before the cleanup
+	// functions are executed, which would interfere with a clean test teardown.
+	ctx, cancel := context.WithCancel(context.Background())
+	suite.T().Cleanup(cancel)
+
 	// Prevent the metrics listener being created
 	metricsserver.DefaultBindAddress = "0"
 
-	env = &envtest.Environment{}
-	env.BinaryAssetsDirectory = "../../bin"
+	env := &envtest.Sharded{
+		StartTimeout: 2 * time.Minute,
+		StopTimeout:  time.Second * 30,
+		WorkDir:      filepath.Join(os.Getenv("COMPONENT_DIRECTORY"), ".test", "ContentConfigurationTestSuite"),
+	}
+
 	err = os.Setenv("PRESERVE", "true")
 	suite.Require().NoError(err, "failed to set PRESERVE environment variable")
-	kcpConfig, err = env.Start()
+
+	err = env.Start(ctx)
 	if err != nil {
-		suite.T().Fatalf("envtest failed to start (e.g. missing kcp binary in bin/): %v", err)
+		suite.T().Fatalf("envtest failed to start (e.g. missing kcp binaries in bin/): %v", err)
 	}
+
+	suite.T().Cleanup(func() {
+		if err := env.Stop(); err != nil {
+			suite.T().Logf("Error stopping kcp environment: %v", err)
+		}
+	})
+
+	kcpConfig := env.Config()
 
 	suite.cli, err = clusterclient.New(kcpConfig, client.Options{})
 	suite.Require().NoError(err, "failed to create cluster client")
@@ -116,9 +127,9 @@ func (suite *ContentConfigurationTestSuite) SetupSuite() {
 	suite.consumerWS, suite.consumer = envtest.NewWorkspaceFixture(suite.T(), suite.cli, core.RootCluster.Path(), envtest.WithNamePrefix("consumer"))
 
 	// Prepare apiexports and resource schema
-	suite.loadFromFile("../../test/setup/apiresourceschema-providermetadatas.ui.platform-mesh.io.yaml", suite.provider)
-	suite.loadFromFile("../../test/setup/apiresourceschema-contentconfigurations.ui.platform-mesh.io.yaml", suite.provider)
-	suite.loadFromFile("../../test/setup/apiexport-ui.platform-mesh.io.yaml", suite.provider)
+	suite.loadFromFile(ctx, "../../test/setup/apiresourceschema-providermetadatas.ui.platform-mesh.io.yaml", suite.provider)
+	suite.loadFromFile(ctx, "../../test/setup/apiresourceschema-contentconfigurations.ui.platform-mesh.io.yaml", suite.provider)
+	suite.loadFromFile(ctx, "../../test/setup/apiexport-ui.platform-mesh.io.yaml", suite.provider)
 
 	// Create apiexportendpointslice
 	aes := &apisv1alpha1.APIExportEndpointSlice{
@@ -132,7 +143,7 @@ func (suite *ContentConfigurationTestSuite) SetupSuite() {
 			},
 		},
 	}
-	suite.cli.Cluster(suite.provider).Create(suite.ctx, aes) //nolint:errcheck
+	suite.cli.Cluster(suite.provider).Create(ctx, aes) //nolint:errcheck
 
 	ab := &apisv1alpha1.APIBinding{
 		ObjectMeta: metav1.ObjectMeta{
@@ -147,16 +158,23 @@ func (suite *ContentConfigurationTestSuite) SetupSuite() {
 			},
 		},
 	}
-	err = suite.cli.Cluster(suite.consumer).Create(suite.ctx, ab)
-	suite.Require().NoError(err, "failed to create APIBinding for ui.platform-mesh.io in consumer workspace")
+	var createErr error
+	suite.Eventually(func() bool {
+		createErr = suite.cli.Cluster(suite.consumer).Create(ctx, ab.DeepCopy())
+		if apierrors.IsAlreadyExists(createErr) {
+			createErr = nil
+		}
+		return createErr == nil
+	}, defaultTestTimeout, defaultTickInterval)
+	suite.Require().NoError(createErr, "failed to create APIBinding for ui.platform-mesh.io in consumer workspace")
 
 	suite.Eventually(func() bool {
-		getErr := suite.cli.Cluster(suite.consumer).Get(suite.ctx, types.NamespacedName{Name: "ui.platform-mesh.io"}, ab)
+		getErr := suite.cli.Cluster(suite.consumer).Get(ctx, types.NamespacedName{Name: "ui.platform-mesh.io"}, ab)
 		return getErr == nil && ab.Status.Phase == apisv1alpha1.APIBindingPhaseBound
 	}, 10*time.Second, 100*time.Millisecond, "APIBinding for ui.platform-mesh.io in consumer workspace did not become ready")
 
 	// lookup api export
-	err = suite.cli.Cluster(suite.provider).Get(suite.ctx, types.NamespacedName{Name: "ui.platform-mesh.io"}, aes)
+	err = suite.cli.Cluster(suite.provider).Get(ctx, types.NamespacedName{Name: "ui.platform-mesh.io"}, aes)
 	suite.Require().NoError(err, "failed to get APIExport for ui.platform-mesh.io in provider workspace")
 
 	// Config must point at the provider workspace so discovery can find APIExportEndpointSlice there
@@ -178,6 +196,32 @@ func (suite *ContentConfigurationTestSuite) SetupSuite() {
 		}
 		return rt
 	})
+	// The provider drops a virtual workspace URL whose first watch fails and only retries it when
+	// the endpoint slice changes again, so kcp must already answer discovery on every endpoint
+	// before the provider starts. Right after creation the slice can list a URL that still 404s.
+	// The provider's wildcard cache talks to <url>/clusters/*, and the bare URL never serves
+	// discovery, so probe the same path.
+	suite.Eventually(func() bool {
+		if err := suite.cli.Cluster(suite.provider).Get(ctx, types.NamespacedName{Name: "ui.platform-mesh.io"}, aes); err != nil {
+			return false
+		}
+		if len(aes.Status.APIExportEndpoints) == 0 {
+			return false
+		}
+		for _, endpoint := range aes.Status.APIExportEndpoints {
+			endpointConfig := rest.CopyConfig(providerConfig)
+			endpointConfig.Host = strings.TrimSuffix(endpoint.URL, "/") + "/clusters/*"
+			dc, err := discovery.NewDiscoveryClientForConfig(endpointConfig)
+			if err != nil {
+				return false
+			}
+			if _, err := dc.ServerGroups(); err != nil {
+				return false
+			}
+		}
+		return true
+	}, 4*defaultTestTimeout, defaultTickInterval, "APIExport virtual workspace for ui.platform-mesh.io did not start serving discovery")
+
 	provider, err := apiexport.New(providerConfig, "ui.platform-mesh.io", apiexport.Options{Scheme: scheme.Scheme})
 	suite.Require().NoError(err, "failed to create APIExport provider for ui.platform-mesh.io")
 
@@ -190,13 +234,10 @@ func (suite *ContentConfigurationTestSuite) SetupSuite() {
 	err = rec.SetupWithManager(mgr, &platformmeshconfig.CommonServiceConfig{}, log)
 	suite.Require().NoError(err, "failed to setup ContentConfiguration reconciler with manager")
 
-	suite.g, _ = errgroup.WithContext(suite.ctx)
-	suite.g.Go(func() error {
-		return mgr.Start(suite.ctx)
-	})
+	go mgr.Start(ctx)
 }
 
-func (suite *ContentConfigurationTestSuite) loadFromFile(filePath string, workspace logicalcluster.Path) {
+func (suite *ContentConfigurationTestSuite) loadFromFile(ctx context.Context, filePath string, workspace logicalcluster.Path) {
 	data, err := os.ReadFile(filePath)
 	require.NoError(suite.T(), err, "failed to read file %s", filePath)
 
@@ -204,21 +245,14 @@ func (suite *ContentConfigurationTestSuite) loadFromFile(filePath string, worksp
 	err = yaml.Unmarshal(data, &u.Object)
 	require.NoError(suite.T(), err, "failed to unmarshal file %s", filePath)
 
-	err = suite.cli.Cluster(workspace).Create(suite.ctx, &u)
+	err = suite.cli.Cluster(workspace).Create(ctx, &u)
 	require.NoError(suite.T(), err, "failed to create resource %s", filePath)
 }
 
-func (suite *ContentConfigurationTestSuite) TearDownSuite() {
-	suite.cancel()
-	suite.g.Wait() //nolint:errcheck
-	env.Stop()     //nolint:errcheck
-}
-
 func (suite *ContentConfigurationTestSuite) TestProcessContentConfiguration() {
-
 	//Given
 	var err error
-	testContext := context.Background()
+	testContext := suite.T().Context()
 	name := "example-content-configuration"
 	cc := &v1alpha1.ContentConfiguration{
 		ObjectMeta: metav1.ObjectMeta{
@@ -341,7 +375,7 @@ func (suite *ContentConfigurationTestSuite) TestContentConfigurationCRCreation()
 				"GET", remoteURL, httpmock.NewStringResponder(200, validation_test.GetValidJSON()),
 			)
 
-			testCtx := context.Background()
+			testCtx := suite.T().Context()
 			instance := &v1alpha1.ContentConfiguration{
 				ObjectMeta: metav1.ObjectMeta{Name: tc.instanceName},
 				Spec:       tc.spec,
@@ -369,7 +403,7 @@ func (suite *ContentConfigurationTestSuite) TestUpdateReconcileCR() {
 	remoteURL := "https://this-address-should-be-mocked-by-httpmock"
 
 	// Given
-	testCtx := context.Background()
+	testCtx := suite.T().Context()
 	contentConfiguration := &v1alpha1.ContentConfiguration{
 		ObjectMeta: metav1.ObjectMeta{Name: "extension-manager"},
 		Spec: v1alpha1.ContentConfigurationSpec{
@@ -465,7 +499,7 @@ func (suite *ContentConfigurationTestSuite) TestUpdateReconcileCR() {
 func (suite *ContentConfigurationTestSuite) TestContentConfigurationCreationCRInternalURL() {
 	remoteURL := "https://this-address-should-be-mocked-by-httpmock"
 	internalURL := "http://internal-url"
-	testCtx := context.Background()
+	testCtx := suite.T().Context()
 	contentConfiguration := &v1alpha1.ContentConfiguration{
 		ObjectMeta: metav1.ObjectMeta{Name: "extension-manager-internal"},
 		Spec: v1alpha1.ContentConfigurationSpec{

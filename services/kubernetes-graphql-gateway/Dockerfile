@@ -15,11 +15,11 @@
 # Build the manager binary.
 #
 # NOTE: the build context is the repository ROOT, not this directory.
-# The operator module is linked to the shared ./apis module through the
-# repository-root go.work file, so the workspace and apis source must be
-# present in the build:
+# The operator module is linked to the shared in-repo modules through the
+# repository-root go.work file and the go.mod replace directives, so the
+# workspace and those module sources must be present in the build:
 #   docker build -f services/kubernetes-graphql-gateway/Dockerfile .
-FROM golang:1.26@sha256:87a41d2539e5671777734e91f467499ed5eafb1fb1f77221dff2744db7a51775 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26.7@sha256:dc2521c2a906db43073b8b4d99f491b6341cf15610b6ebbab187c45153f9959e AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -29,15 +29,17 @@ WORKDIR /workspace
 COPY go.work go.work
 COPY go.work.sum go.work.sum
 COPY apis/ apis/
+COPY golang-commons/ golang-commons/
+COPY subroutines/ subroutines/
 COPY services/kubernetes-graphql-gateway/ services/kubernetes-graphql-gateway/
 
 # Drop every workspace module except the ones copied above, so the workspace
-# resolves with only apis + this operator — regardless of what else go.work lists
+# resolves with only the modules copied above — regardless of what else go.work lists
 # (other operators, cmd/* tools, ...). This is a textual edit of go.work, so the
 # dropped modules don't need to exist in the build context.
 RUN for m in $(go work edit -json | sed -n 's/.*"DiskPath": "\(.*\)".*/\1/p'); do \
       case "$m" in \
-        ./apis|./services/kubernetes-graphql-gateway) ;; \
+        ./apis|./golang-commons|./subroutines|./services/kubernetes-graphql-gateway) ;; \
         *) go work edit -dropuse "$m" ;; \
       esac; \
     done
@@ -52,7 +54,7 @@ RUN go mod download
 # was called. For example, if we call make docker-build in a local env which has the Apple Silicon M1 SO
 # the docker BUILDPLATFORM arg will be linux/arm64 when for Apple x86 it will be linux/amd64. Therefore,
 # by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -o /workspace/manager main.go
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -ldflags '-w -s' -o /workspace/manager main.go
 
 # Use distroless as minimal base image to package the manager binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details

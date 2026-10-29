@@ -25,6 +25,7 @@ type SearchRequest struct {
 	Mode         string
 	Resource     string
 	Filters      map[string][]string
+	FGARole      string
 	Limit        int
 	Page         int
 	Cursor       string
@@ -32,7 +33,8 @@ type SearchRequest struct {
 
 type SearchResponse struct {
 	Results    []SearchHit `json:"results"`
-	NextCursor *string     `json:"nextCursor"`
+	NextCursor *string     `json:"nextCursor,omitempty"`
+	TotalCount *int        `json:"totalCount,omitempty"`
 }
 
 type SearchHit struct {
@@ -102,21 +104,35 @@ type OpenSearchHit struct {
 	Source map[string]any
 }
 
+// OpenSearchPage is one batch of hits. TimedOut and the shard counters describe
+// partial responses: OpenSearch answers 200 when only some shards fail, so Hits
+// and TotalCount can silently cover fewer indices than were queried.
 type OpenSearchPage struct {
 	Hits              []OpenSearchHit
 	AggregationValues []string
+	TotalCount        int
+	TimedOut          bool
+	ShardsTotal       int
+	ShardsFailed      int
+	ShardFailures     []string
+}
+
+// Partial reports whether the page covers less than the queried index set.
+func (p OpenSearchPage) Partial() bool {
+	return p.TimedOut || p.ShardsFailed > 0
 }
 
 type OpenSearchQuery struct {
-	Indices          []string
-	Query            string
-	Mode             string
-	Fields           []string
-	SemanticFields   []string
-	Filters          map[string][]string
-	Size             int
-	SearchAfter      []any
-	AggregationField string
+	Indices           []string
+	Query             string
+	Mode              string
+	Fields            []string
+	SemanticFields    []string
+	Filters           map[string][]string
+	AccountFGAObjects []string
+	Size              int
+	SearchAfter       []any
+	AggregationField  string
 }
 
 type AuthorizationRequest struct {
@@ -143,6 +159,7 @@ type OpenSearchSearcher interface {
 }
 
 type FGAAuthorizer interface {
+	ListAccessibleAccounts(ctx context.Context, organization, user, relation string) ([]string, error)
 	FilterAuthorized(ctx context.Context, req AuthorizationRequest) (AuthorizationResult, error)
 }
 

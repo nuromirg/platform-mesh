@@ -27,6 +27,7 @@ import (
 	"go.platform-mesh.io/search-operator/internal/opensearch"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/multicluster-runtime/pkg/multicluster"
 )
 
@@ -223,6 +224,59 @@ func TestMapResourceToFGAObject(t *testing.T) {
 	}
 }
 
+func TestResolveAccountFGAObject(t *testing.T) {
+	accountInfo := &pmcorev1alpha1.AccountInfo{
+		Spec: pmcorev1alpha1.AccountInfoSpec{
+			Account: pmcorev1alpha1.AccountLocation{
+				Name:            "teams",
+				OriginClusterId: "account-origin",
+			},
+			Organization: pmcorev1alpha1.AccountLocation{
+				Name:            "sap",
+				OriginClusterId: "org-origin",
+			},
+		},
+	}
+
+	tests := []struct {
+		name              string
+		gvk               schema.GroupVersionKind
+		resourceClusterID multicluster.ClusterName
+		resourceName      string
+		want              string
+	}{
+		{
+			name:              "regular resource uses the account it lives in",
+			gvk:               schema.GroupVersionKind{Group: pmcorev1alpha1.GroupName, Kind: "Component"},
+			resourceClusterID: "component-cluster",
+			resourceName:      "my-component",
+			want:              "core_platform-mesh_io_account:account-origin/teams",
+		},
+		{
+			name:              "account resource uses itself, not its parent",
+			gvk:               schema.GroupVersionKind{Group: pmcorev1alpha1.GroupName, Kind: pmsearchv1alpha1.AccountKind},
+			resourceClusterID: "account-origin",
+			resourceName:      "workspace-a",
+			want:              "core_platform-mesh_io_account:account-origin/workspace-a",
+		},
+		{
+			name:              "account kind in another group is not treated as an account",
+			gvk:               schema.GroupVersionKind{Group: "other.platform-mesh.io", Kind: pmsearchv1alpha1.AccountKind},
+			resourceClusterID: "other-cluster",
+			resourceName:      "workspace-a",
+			want:              "core_platform-mesh_io_account:account-origin/teams",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := resolveAccountFGAObject(tt.gvk, tt.resourceClusterID, tt.resourceName, accountInfo); got != tt.want {
+				t.Fatalf("resolveAccountFGAObject() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestResolveResourceClusterID(t *testing.T) {
 	resourceWithAnnotation := &unstructured.Unstructured{}
 	resourceWithAnnotation.SetAnnotations(map[string]string{
@@ -318,6 +372,88 @@ func TestExtractConfiguredFieldsSupportsNestedPaths(t *testing.T) {
 	}
 	if spec["summary"] != "nested summary" {
 		t.Fatalf("spec.summary = %v, want nested summary", spec["summary"])
+	}
+}
+
+func TestExtractConfiguredFieldsSkipsDotOnlyMapKeys(t *testing.T) {
+	resource := &unstructured.Unstructured{
+		Object: map[string]any{
+			"metadata": map[string]any{
+				"labels": map[string]any{
+					".":     "dot-only-key",
+					"..":    "double-dot-key",
+					"valid": "keep-this",
+				},
+			},
+		},
+	}
+
+	got := extractConfiguredFields(resource, []string{"metadata.labels"})
+	meta, ok := got["metadata"].(map[string]any)
+	if !ok {
+		t.Fatalf("metadata = %T, want map[string]any", got["metadata"])
+	}
+	labels, ok := meta["labels"].(map[string]any)
+	if !ok {
+		t.Fatalf("metadata.labels = %T, want map[string]any", meta["labels"])
+	}
+
+	if _, exists := labels["."]; exists {
+		t.Error("labels[\".\"] should have been stripped")
+	}
+	if _, exists := labels[".."]; exists {
+		t.Error("labels[\"..\"] should have been stripped")
+	}
+	if labels["valid"] != "keep-this" {
+		t.Errorf("labels[\"valid\"] = %v, want keep-this", labels["valid"])
+	}
+}
+
+func TestExtractConfiguredFieldsSkipsDotOnlyKeysInArrayOfObjects(t *testing.T) {
+	resource := &unstructured.Unstructured{
+		Object: map[string]any{
+			"spec": map[string]any{
+				"items": []any{
+					map[string]any{
+						".":     "bad",
+						"valid": "good",
+					},
+					map[string]any{
+						"..": "also-bad",
+						"ok": "fine",
+					},
+				},
+			},
+		},
+	}
+
+	got := extractConfiguredFields(resource, []string{"spec.items"})
+	spec, ok := got["spec"].(map[string]any)
+	if !ok {
+		t.Fatalf("spec = %T, want map[string]any", got["spec"])
+	}
+	items, ok := spec["items"].([]any)
+	if !ok {
+		t.Fatalf("spec.items = %T, want []any", spec["items"])
+	}
+	if len(items) != 2 {
+		t.Fatalf("spec.items len = %d, want 2", len(items))
+	}
+
+	first := items[0].(map[string]any)
+	if _, exists := first["."]; exists {
+		t.Error("items[0][\".\"] should have been stripped")
+	}
+	if first["valid"] != "good" {
+		t.Errorf("items[0][\"valid\"] = %v, want good", first["valid"])
+	}
+
+	second := items[1].(map[string]any)
+	if _, exists := second[".."]; exists {
+		t.Error("items[1][\"..\"] should have been stripped")
+	}
+	if second["ok"] != "fine" {
+		t.Errorf("items[1][\"ok\"] = %v, want fine", second["ok"])
 	}
 }
 

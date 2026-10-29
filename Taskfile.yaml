@@ -37,6 +37,15 @@ includes:
   tools:
     taskfile: tools/Taskfile.yaml
     dir: .
+  # Helm charts: `task charts:lint`, `task charts:test`, `task charts:docs`, ...
+  charts:
+    taskfile: charts/Taskfile.yaml
+    dir: .
+  # Playwright end-to-end tests against a running Platform Mesh:
+  # `task tests:portal-e2e:setup`, `task tests:portal-e2e:remote`, ...
+  tests:
+    taskfile: tests/Taskfile.yaml
+    dir: .
 
 vars:
   COMPONENTS:
@@ -50,6 +59,9 @@ vars:
     - backup-operator
     - extension-manager-operator
     - kcp-migration-operator
+    - kro-composition-operator
+    - platform-mesh-deployer
+    - platform-mesh-operator
     - resource-broker
     - search-operator
     - security-operator
@@ -62,6 +74,11 @@ vars:
     - search-service
     - virtual-workspaces
 
+  LIBRARIES:
+    - apis
+    - subroutines
+    - golang-commons
+
 tasks:
   default:
     cmds:
@@ -73,9 +90,39 @@ tasks:
   verify:
     desc: Runs all check targets in sequence.
     cmds:
+      - task: dco
       - task: lint
       - task: boilerplate
       - task: tidy-check
+  dco:
+    desc: 'Every commit on this branch needs a Signed-off-by matching its author (BASE=<ref> to override the comparison point).'
+    vars:
+      BASE: '{{.BASE | default "origin/main"}}'
+    cmds:
+      - |
+        base='{{.BASE}}'
+        if ! git rev-parse --verify --quiet "$base^{commit}" >/dev/null; then
+          echo "dco: cannot resolve base ref '$base', skipping (set BASE=<ref> to pick another)" >&2
+          exit 0
+        fi
+        # Mirrors the DCO app that gates pull requests: merge commits and bot
+        # authors are exempt, and the sign-off email must match the author's.
+        # The whole message is scanned, not just the trailer block -- a commit
+        # may end with another paragraph (e.g. On-behalf-of:), which would hide
+        # the sign-off from git's trailer parser but still satisfies the app.
+        bad=$(git rev-list --no-merges "$base..HEAD" | while read -r sha; do
+          author=$(git show -s --format='%ae' "$sha" | tr 'A-Z' 'a-z')
+          case "$author" in *"[bot]"*) continue ;; esac
+          git show -s --format='%B' "$sha" | grep -i '^signed-off-by:' \
+            | tr 'A-Z' 'a-z' | grep -qF "<$author>" \
+            || git show -s --format='  %h %s' "$sha"
+        done)
+        if [ -n "$bad" ]; then
+          echo "Commits without a Signed-off-by matching the commit author:" >&2
+          echo "$bad" >&2
+          echo "Fix with: git rebase --signoff $base" >&2
+          exit 1
+        fi
   lint:
     desc: Lint every component.
     cmds:
@@ -93,6 +140,13 @@ tasks:
         # --skip args from hack/boilerplate/skip.txt, ignoring blank lines and '#' comment lines.
         skip_args=$(grep -vE '^[[:space:]]*(#|$)' hack/boilerplate/skip.txt | sed 's/^/--skip /' | tr '\n' ' ')
         ./hack/verify_boilerplate.py --boilerplate-dir hack/boilerplate/ $skip_args
+  boilerplate-fix:
+    desc: Prepends the boilerplate comment to source files that are missing it.
+    cmds:
+      - |
+        # --skip args from hack/boilerplate/skip.txt, ignoring blank lines and '#' comment lines.
+        skip_args=$(grep -vE '^[[:space:]]*(#|$)' hack/boilerplate/skip.txt | sed 's/^/--skip /' | tr '\n' ' ')
+        ./hack/fix_boilerplate.py --boilerplate-dir hack/boilerplate/ $skip_args
   test:
     desc: Run unit tests for every component.
     cmds:
@@ -187,8 +241,7 @@ tasks:
     cmds:
       - task: lint-{{index .MATCH 0}}
       - task: tidy-check-{{index .MATCH 0}}
-      # TODO: Currently lots of files do not have the correct boilerplate.
-      # - task: boilerplate-{{index .MATCH 0}}
+      - task: boilerplate-{{index .MATCH 0}}
   "images-*":
     desc: "Build (and optionally push) one component's image (e.g. task images-account-operator VERSION=v0.1.0 PUSH=true)."
     vars:
@@ -282,27 +335,11 @@ tasks:
           "$context"
 
   # ---------------------------------------------------------------------------
-  # Release: cut a per-component semver tag (cmd/release). The tag (<name>/v*)
-  # triggers that component's release workflow (e.g. account-operator.yml), which
-  # builds + signs the image, cuts a GitHub release, bumps the chart and publishes
-  # SBOM + OCM. `apis` tags are go-gettable module tags only. Pass component +
-  # flags after `--`, e.g.:
-  #   task release -- account-operator --minor
-  #   task release -- all --dry-run
-  # ---------------------------------------------------------------------------
-  release:
-    desc: 'Cut a release tag for a component (e.g. task release -- account-operator --minor).'
-    dir: cmd/release
-    env:
-      GOWORK: "off"   # cmd/release is a standalone tool module, not in the workspace.
-    cmds:
-      - go run . {{.CLI_ARGS}}
-
   # Point every consumer at a released version of an internal module. Generic
   # over the module: the component's own go.mod supplies the module path, so the
   # same target works for apis, golang-commons, subroutines, ... — nothing is
-  # hardcoded. `cmd/release` prints the exact invocation after tagging such a
-  # module; run it, then commit the resulting go.mod/go.sum changes.
+  # hardcoded. Run it after tagging a module (git tag <module>/vX.Y.Z), then
+  # commit the resulting go.mod/go.sum changes.
   #   task bump-deps -- apis v0.0.1
   bump-deps:
     desc: 'Point every consumer at a released internal-module version (e.g. task bump-deps -- apis v0.0.1).'
@@ -345,9 +382,9 @@ tasks:
   tidy:
     desc: Tidy every module's go.mod (standalone) and re-sync the workspace.
     cmds:
+      - go work sync
       - for: {var: COMPONENTS}
         cmd: task tidy-{{.ITEM}}
-      - go work sync
       # ref: https://github.com/golang/go/issues/63901
       # TLDR: go work sync doesn't actually everything.
       # We force fill the go.work.sum by downloading all deps.
@@ -371,7 +408,7 @@ tasks:
         # it resolves standalone, e.g. in docker builds.
         replaces=$(GOWORK= go work edit -json | jq -r '.Replace[] | "\(.Old.Path)=\(.New.Path)@\(.New.Version)"')
         cd "$dir"
-        for r in $replaces; do go mod edit -replace="$r"; done
+        go mod edit $(printf ' -replace=%s' $replaces)
         go mod tidy
         # Drop old replaces and those whose Old path isn't referenced by this module.
         deps=$(go list -m -f '{{`{{.Path}}`}}' all)

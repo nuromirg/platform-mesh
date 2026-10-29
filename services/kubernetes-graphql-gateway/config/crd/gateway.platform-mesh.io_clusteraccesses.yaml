@@ -166,16 +166,60 @@ spec:
                 description: Path is an optional field. If not set, the name of the
                   resource is used
                 type: string
+              requestIdentityMode:
+                description: |-
+                  RequestIdentityMode controls which identity the gateway uses for
+                  Kubernetes requests. When omitted or set to userToken, the gateway requires,
+                  validates, and forwards the caller's bearer token. serviceAccount accepts
+                  tokenless requests and always uses auth.serviceAccountRef instead.
+                enum:
+                - userToken
+                - serviceAccount
+                type: string
               requestPathTemplate:
                 description: |-
                   RequestPathTemplate defines a URL path template prepended to upstream API requests
                   at gateway time. The {clusterTarget} variable is resolved from the GraphQL extensions
                   field at request time. Example: "/clusters/{clusterTarget}"
                 type: string
+              schemaFilter:
+                description: |-
+                  SchemaFilter restricts which Kubernetes resource types are exposed as typed GraphQL operations.
+                  If unset, all discovered resource types are exposed.
+                properties:
+                  include:
+                    description: Include contains selectors that are ORed together.
+                    items:
+                      description: ResourceSelector matches Kubernetes resources by
+                        exact group and, optionally, version and resource name.
+                      properties:
+                        group:
+                          description: Group is the Kubernetes API group. Use an empty
+                            string for the core API group.
+                          type: string
+                        resource:
+                          description: Resource is the optional lowercase, plural
+                            Kubernetes resource name to match.
+                          type: string
+                        version:
+                          description: Version is the optional Kubernetes API version
+                            to match.
+                          type: string
+                      required:
+                      - group
+                      type: object
+                    minItems: 1
+                    type: array
+                required:
+                - include
+                type: object
             type: object
             x-kubernetes-validations:
             - message: host is required unless kubeconfigSecretRef auth is used
               rule: has(self.host) || (has(self.auth) && has(self.auth.kubeconfigSecretRef))
+            - message: requestIdentityMode serviceAccount requires auth.serviceAccountRef
+              rule: '!has(self.requestIdentityMode) || self.requestIdentityMode !=
+                ''serviceAccount'' || (has(self.auth) && has(self.auth.serviceAccountRef))'
           status:
             description: ClusterAccessStatus defines the observed state of ClusterAccess.
             properties:

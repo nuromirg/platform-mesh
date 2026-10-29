@@ -34,8 +34,19 @@ type ClusterAccess struct {
 	Status ClusterAccessStatus `json:"status,omitempty"`
 }
 
+// RequestIdentityMode selects the identity used for gateway requests.
+type RequestIdentityMode string
+
+const (
+	// RequestIdentityModeUserToken validates and forwards the caller's bearer token.
+	RequestIdentityModeUserToken RequestIdentityMode = "userToken"
+	// RequestIdentityModeServiceAccount uses the ClusterAccess ServiceAccount for every request.
+	RequestIdentityModeServiceAccount RequestIdentityMode = "serviceAccount"
+)
+
 // ClusterAccessSpec defines the desired state of ClusterAccess
 // +kubebuilder:validation:XValidation:rule="has(self.host) || (has(self.auth) && has(self.auth.kubeconfigSecretRef))",message="host is required unless kubeconfigSecretRef auth is used"
+// +kubebuilder:validation:XValidation:rule="!has(self.requestIdentityMode) || self.requestIdentityMode != 'serviceAccount' || (has(self.auth) && has(self.auth.serviceAccountRef))",message="requestIdentityMode serviceAccount requires auth.serviceAccountRef"
 type ClusterAccessSpec struct {
 	// Path is an optional field. If not set, the name of the resource is used
 	// +optional
@@ -63,6 +74,40 @@ type ClusterAccessSpec struct {
 	// Auth configuration for the cluster
 	// +optional
 	Auth *AuthConfig `json:"auth,omitempty"`
+
+	// SchemaFilter restricts which Kubernetes resource types are exposed as typed GraphQL operations.
+	// If unset, all discovered resource types are exposed.
+	// +optional
+	SchemaFilter *SchemaFilter `json:"schemaFilter,omitempty"`
+
+	// RequestIdentityMode controls which identity the gateway uses for
+	// Kubernetes requests. When omitted or set to userToken, the gateway requires,
+	// validates, and forwards the caller's bearer token. serviceAccount accepts
+	// tokenless requests and always uses auth.serviceAccountRef instead.
+	// +kubebuilder:validation:Enum=userToken;serviceAccount
+	// +optional
+	RequestIdentityMode RequestIdentityMode `json:"requestIdentityMode,omitempty"`
+}
+
+// SchemaFilter selects the Kubernetes resource types exposed as typed GraphQL operations.
+type SchemaFilter struct {
+	// Include contains selectors that are ORed together.
+	// +kubebuilder:validation:MinItems=1
+	Include []ResourceSelector `json:"include"`
+}
+
+// ResourceSelector matches Kubernetes resources by exact group and, optionally, version and resource name.
+type ResourceSelector struct {
+	// Group is the Kubernetes API group. Use an empty string for the core API group.
+	Group string `json:"group"`
+
+	// Version is the optional Kubernetes API version to match.
+	// +optional
+	Version string `json:"version,omitempty"`
+
+	// Resource is the optional lowercase, plural Kubernetes resource name to match.
+	// +optional
+	Resource string `json:"resource,omitempty"`
 }
 
 // CAConfig defines CA configuration options

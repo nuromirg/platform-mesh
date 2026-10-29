@@ -26,10 +26,11 @@ import (
 	pmcontext "go.platform-mesh.io/golang-commons/context"
 	"go.platform-mesh.io/golang-commons/logger"
 	appcontext "go.platform-mesh.io/search-service/internal/context"
+	"go.platform-mesh.io/search-service/internal/httperr"
 	"go.platform-mesh.io/search-service/internal/service/search"
 )
 
-var issuerRegex = regexp.MustCompile(`^.*\/realms\/(.*?)\/?$`)
+var issuerRegex = regexp.MustCompile(`^.*/realms/(.*?)/?$`)
 
 const defaultLocalDevelopmentOrg = "local"
 
@@ -37,9 +38,10 @@ type OrgContextMiddleware struct {
 	validator        search.OrgAccessValidator
 	localDevelopment bool
 	localOrg         string
+	userClaim        string
 }
 
-func NewOrgContextMiddleware(validator search.OrgAccessValidator, localDevelopment bool, localOrg string) *OrgContextMiddleware {
+func NewOrgContextMiddleware(validator search.OrgAccessValidator, localDevelopment bool, localOrg, userClaim string) *OrgContextMiddleware {
 	localOrg = strings.TrimSpace(localOrg)
 	if localOrg == "" {
 		localOrg = defaultLocalDevelopmentOrg
@@ -48,6 +50,7 @@ func NewOrgContextMiddleware(validator search.OrgAccessValidator, localDevelopme
 		validator:        validator,
 		localDevelopment: localDevelopment,
 		localOrg:         localOrg,
+		userClaim:        strings.TrimSpace(userClaim),
 	}
 }
 
@@ -59,59 +62,57 @@ func (o *OrgContextMiddleware) SetRequestContext() func(http.Handler) http.Handl
 
 			org := extractSubdomain(r.Host)
 			if org == "" {
-				http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+				httperr.Write(w, r, httperr.AuthenticationRequired)
 				return
 			}
-			localHost := isLocalHost(r.Host)
-			if o.localDevelopment || localHost {
+
+			if o.localDevelopment {
 				org = o.localOrg
 			}
 
 			token, err := pmcontext.GetWebTokenFromContext(ctx)
 			if err != nil {
-				http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+				httperr.Write(w, r, httperr.AuthenticationRequired)
 				return
 			}
 
-			if !o.localDevelopment && !localHost {
+			if !o.localDevelopment {
 				authHeader, err := pmcontext.GetAuthHeaderFromContext(ctx)
 				if err != nil {
-					http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+					httperr.Write(w, r, httperr.AuthenticationRequired)
 					return
 				}
 				authHeader, err = normalizeBearerAuthHeader(authHeader)
 				if err != nil {
-					http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+					httperr.Write(w, r, httperr.AuthenticationRequired)
 					return
 				}
 
-				allowed, err := o.validator.ValidateTokenForOrg(ctx, authHeader, org)
+				valid, err := o.validator.ValidateTokenForOrg(ctx, authHeader, org)
 				if err != nil {
 					log.Error().
 						Err(err).
 						Str("organization", org).
-						Msg("failed to validate token for org access")
-					http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+						Msg("failed to validate JWT")
+					httperr.Write(w, r, httperr.AuthenticationUnavailable)
 					return
 				}
-				if !allowed {
-					http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+				if !valid {
+					httperr.Write(w, r, httperr.AuthenticationRequired)
 					return
 				}
 			}
 
-			user := strings.TrimSpace(token.Mail)
-			if user == "" {
-				user = strings.TrimSpace(token.Subject)
-			}
-			if user == "" {
-				http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			user, found := token.Claims.String(o.userClaim)
+			user = strings.TrimSpace(user)
+			if !found || user == "" {
+				httperr.Write(w, r, httperr.AuthenticationRequired)
 				return
 			}
 
 			tenant, err := extractTenant(token.Issuer)
 			if err != nil {
-				http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+				httperr.Write(w, r, httperr.AuthenticationRequired)
 				return
 			}
 
@@ -138,19 +139,6 @@ func extractSubdomain(host string) string {
 		return ""
 	}
 	return strings.TrimSpace(parts[0])
-}
-
-func isLocalHost(host string) bool {
-	if host == "" {
-		return false
-	}
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	} else {
-		host = strings.Split(host, ":")[0]
-	}
-	host = strings.TrimSpace(strings.ToLower(host))
-	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
 func normalizeBearerAuthHeader(header string) (string, error) {

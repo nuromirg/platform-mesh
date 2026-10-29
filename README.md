@@ -11,7 +11,7 @@
 
 Platform Mesh is an open, multi-tenant developer platform built on [kcp](https://github.com/kcp-dev/kcp). It provides account-based tenancy, relationship-based authorization (ReBAC via [OpenFGA](https://openfga.dev/)), search, and UI extensibility on top of a Kubernetes-like control plane.
 
-This repository is the Platform Mesh **monorepo**: it consolidates the shared libraries, operators, services, and tooling that make up the platform. Each component is its own Go module, linked together through the repository-root [`go.work`](go.work) workspace, and released independently via component-scoped tags.
+This repository is the Platform Mesh **monorepo**: it consolidates the shared libraries, operators, services, and tooling that make up the platform. Each component is its own Go module, linked together through the repository-root [`go.work`](go.work) workspace. The Helm charts (`charts/`), the OCM component definitions (`ocm/`) and the installation guide (`installation/`) live here as well.
 
 ## Components
 
@@ -46,10 +46,6 @@ This repository is the Platform Mesh **monorepo**: it consolidates the shared li
 | [rebac-authz-webhook](services/rebac-authz-webhook) | Kubernetes authorization webhook backed by OpenFGA (ReBAC). |
 | [kubernetes-graphql-gateway](services/kubernetes-graphql-gateway) | Exposes Kubernetes resources as a GraphQL API for UIs and tools. |
 
-### Tooling
-
-Repository tooling lives under [`cmd/`](cmd) — including [`release`](cmd/release), which cuts component-scoped release tags for the monorepo.
-
 ## Getting started
 
 Each module can be built and tested on its own, or through the repository-root [Taskfile](Taskfile.yaml), which fans out to every component:
@@ -71,9 +67,50 @@ task images-search-service VERSION=v0.1.0 PUSH=false
 
 The modules are linked through the root [`go.work`](go.work), so cross-module changes resolve against local source during development.
 
+## Development
+
+For the inner loop, [Tilt](https://tilt.dev) replaces the OCM/Flux delivery pipeline: static infrastructure is deployed once into a kind cluster, and the components you are working on hot-reload in seconds.
+
+```sh
+# the cluster MUST be named platform-mesh — the Tiltfile refuses any kube
+# context other than kind-platform-mesh, so a stray `tilt up` cannot hit a
+# shared cluster. Override with TILT_ALLOWED_CONTEXT.
+kind create cluster --name platform-mesh
+tilt up -f contrib/tilt/Tiltfile -- --profile=core,auth
+```
+
+The `--` matters: everything after it is parsed by the Tiltfile, not by Tilt itself.
+
+### Profiles
+
+Profiles are independent feature layers, not an ordered ladder — each only ever *adds* resources, so several can be requested at once (`--profile=core,auth`, `--profile=core --profile=auth`, or `--profile=full` for all of them). An unknown profile fails the Tiltfile rather than being silently ignored, so a typo cannot quietly give you a smaller environment than you asked for.
+
+| Profile | Adds |
+|---------|------|
+| `infra` | the base environment — namespace, cert-manager issuer, envoy `Gateway`, a mutual-TLS etcd, dex, and kcp, which `platform-mesh-deployer` builds from a `PlatformMesh`. **Always on**; naming it is allowed but redundant |
+| `core` | nothing yet (reserved) |
+| `auth` | the ReBAC authorization webhook secret on kcp (L3) |
+| `full` | shorthand for all of the above |
+
+### Charts
+
+The Helm charts live in [`charts/`](charts) and are rendered from there directly, so chart changes are picked up live. Set `TILT_CHARTS_FROM_OCI=1` to pull the pinned published versions instead, or `HELM_CHARTS_DIR` to use another checkout.
+
+kcp needs no such override: it is built in-cluster from a `PlatformMesh` rather than fetched, so there is nothing external to pin.
+
+### Validating manifests without a cluster
+
+```sh
+TILT_NO_INFRA=1 tilt alpha tiltfile-result -f contrib/tilt/Tiltfile -- --profile=full
+```
+
+This renders the local manifests and the `PlatformMesh` and topology templates kcp is built from, with every substitution applied — no cluster and no remote fetches — so gateway wiring, OIDC issuer and the authorization webhook can be confirmed before deploying.
+
+See [contrib/tilt/README.md](contrib/tilt/README.md) for the full environment: what each resource is, how kcp gets built, and how to poke at it.
+
 ## Releasing
 
-Releases are component-scoped: tagging `<component>/vX.Y.Z` triggers that component's GitHub Actions workflow to build and sign its image, cut a GitHub release, bump its chart, and publish a signed OCM component. The [`release`](cmd/release) tool (`task release`) manages the tag registry and ordering.
+Platform Mesh has one version, `vYY.MM.P` (CalVer: `v26.10.0` is the October 2026 release). Tagging it builds every component image and chart from that commit, publishes the signed OCM component graph and creates a GitHub release; patch releases are tags on `release-YY.MM` branches, backports are plain cherry-picks. See [docs/release/process.md](docs/release/process.md) and [RFC 015](https://github.com/platform-mesh/architecture/blob/main/rfc/015-versioning.md).
 
 ## Requirements
 

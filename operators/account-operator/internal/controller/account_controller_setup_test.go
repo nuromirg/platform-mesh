@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	pmcorev1alpha1 "go.platform-mesh.io/apis/core/v1alpha1"
@@ -68,31 +69,20 @@ var (
 )
 
 const (
-	defaultWorkspace              = "default"
-	relativeBinaryAssetsDirectory = "../../bin"
+	defaultWorkspace = "default"
 )
 
 // setupKCP starts kcp and sets up the basic platform-mesh workspace structure
 // and configuration.
 func (s *AccountTestSuite) setupKCP() {
-	s.env = &envtest.Environment{AttachKcpOutput: false, KcpStopTimeout: time.Second * 30}
-	s.env.BinaryAssetsDirectory = relativeBinaryAssetsDirectory
-	s.env.KcpStartTimeout = 2 * time.Minute
-	s.env.KcpStopTimeout = 30 * time.Second
-
-	// Set the context in case using an existing kcp instance.
-	if os.Getenv("USE_EXISTING_KCP") != "" && os.Getenv("EXISTING_KCP_CONTEXT") == "" {
-		s.env.ExistingKcpContext = "base"
-	}
-
-	// Prevents kcp from cleaning up workspace fixtures before shutdown, the
-	// instance controlled by envtest is ephemeral anyway.
-	if os.Getenv("PRESERVE") == "" {
-		s.Require().NoError(os.Setenv("PRESERVE", "true"))
+	s.env = &envtest.Sharded{
+		StartTimeout: 2 * time.Minute,
+		StopTimeout:  time.Second * 30,
+		WorkDir:      filepath.Join(os.Getenv("COMPONENT_DIRECTORY"), ".test", "AccountTestSuite"),
 	}
 
 	var err error
-	s.kcpConfig, err = s.env.Start()
+	err = s.env.Start(s.ctx)
 	s.Require().NoError(err)
 
 	s.T().Cleanup(func() {
@@ -100,6 +90,8 @@ func (s *AccountTestSuite) setupKCP() {
 			s.T().Logf("Error stopping kcp environment: %v", err)
 		}
 	})
+
+	s.kcpConfig = s.env.Config()
 
 	s.kcpClient, err = mcc.New(s.kcpConfig, ctrlruntimeclient.Options{
 		Scheme: s.scheme,
@@ -176,10 +168,11 @@ func (s *AccountTestSuite) setupKCP() {
 	} {
 		var workspaceType kcptenancyv1alpha1.WorkspaceType
 		s.Require().NoError(yaml.Unmarshal(workspaceTypeYAML, &workspaceType))
-		err = rootClient.Create(s.ctx, &workspaceType)
-		if err != nil && !apierrors.IsAlreadyExists(err) {
-			s.Require().NoError(err)
-		}
+		// The bind permission check can lag behind the new APIExport when it is on another shard.
+		s.Require().Eventually(func() bool {
+			err := rootClient.Create(s.ctx, workspaceType.DeepCopy())
+			return err == nil || apierrors.IsAlreadyExists(err)
+		}, 30*time.Second, 500*time.Millisecond, "WorkspaceType %s should be created", workspaceType.Name)
 		s.logger.Info().Msgf("Created WorkspaceType '%s' in root workspace", workspaceType.Name)
 	}
 

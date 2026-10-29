@@ -21,12 +21,15 @@ import (
 	"fmt"
 	"time"
 
+	openfgav1 "github.com/openfga/api/proto/openfga/v1"
+
 	platformeshconfig "go.platform-mesh.io/golang-commons/config"
 	"go.platform-mesh.io/golang-commons/controller/filter"
 	"go.platform-mesh.io/golang-commons/controller/lifecycle/ratelimiter"
 	"go.platform-mesh.io/golang-commons/logger"
 	iclient "go.platform-mesh.io/security-operator/internal/client"
 	"go.platform-mesh.io/security-operator/internal/config"
+	"go.platform-mesh.io/security-operator/internal/fga"
 	"go.platform-mesh.io/security-operator/internal/metrics"
 	"go.platform-mesh.io/security-operator/internal/subroutine"
 	"go.platform-mesh.io/subroutines"
@@ -52,13 +55,14 @@ type ControllerOptions struct {
 }
 
 type OrgLogicalClusterController struct {
+	engageOpts  mcbuilder.EngageOptions
 	log         *logger.Logger
 	name        string
 	lifecycle   *lifecycle.Lifecycle
 	rateLimiter workqueue.TypedRateLimiter[mcreconcile.Request]
 }
 
-func NewOrgLogicalClusterController(log *logger.Logger, kcpClientGetter iclient.KCPClientGetter, cfg config.Config, inClusterClient ctrlruntimeclient.Client, mgr mcmanager.Manager, opts ControllerOptions) (*OrgLogicalClusterController, error) {
+func NewOrgLogicalClusterController(log *logger.Logger, kcpClientGetter iclient.KCPClientGetter, cfg config.Config, inClusterClient ctrlruntimeclient.Client, mgr mcmanager.Manager, fgaClient openfgav1.OpenFGAServiceClient, storeIDGetter fga.StoreIDGetter, opts ControllerOptions) (*OrgLogicalClusterController, error) {
 	rl, err := ratelimiter.NewStaticThenExponentialRateLimiter[mcreconcile.Request](ratelimiter.NewConfig())
 	if err != nil {
 		return nil, fmt.Errorf("creating RateLimiter: %w", err)
@@ -85,6 +89,9 @@ func NewOrgLogicalClusterController(log *logger.Logger, kcpClientGetter iclient.
 	}
 	if cfg.Initializer.WorkspaceAuthEnabled {
 		subs = append(subs, subroutine.NewWorkspaceAuthConfigurationSubroutine(inClusterClient, mgr, kcpClientGetter, cfg))
+	}
+	if cfg.RekeyOrphanedTuplesEnabled {
+		subs = append(subs, subroutine.NewRekeyTuplesSubroutine(cfg, mgr, fgaClient, storeIDGetter, kcpClientGetter))
 	}
 	lc := lifecycle.New(mgr, opts.Name, func() ctrlruntimeclient.Object {
 		return &kcpcorev1alpha1.LogicalCluster{}
@@ -117,6 +124,12 @@ func (r *OrgLogicalClusterController) Reconcile(ctx context.Context, req mcrecon
 	return result, err
 }
 
+// WithEngageOptions limits which clusters the controller engages with; by default it engages all.
+func (r *OrgLogicalClusterController) WithEngageOptions(opts mcbuilder.EngageOptions) *OrgLogicalClusterController {
+	r.engageOpts = opts
+	return r
+}
+
 func (r *OrgLogicalClusterController) SetupWithManager(mgr mcmanager.Manager, cfg *platformeshconfig.CommonServiceConfig, evp ...predicate.Predicate) error {
 	opts := controller.TypedOptions[mcreconcile.Request]{
 		MaxConcurrentReconciles: cfg.MaxConcurrentReconciles,
@@ -125,7 +138,7 @@ func (r *OrgLogicalClusterController) SetupWithManager(mgr mcmanager.Manager, cf
 	predicates := append([]predicate.Predicate{filter.DebugResourcesBehaviourPredicate(cfg.DebugLabelValue)}, evp...)
 	return mcbuilder.ControllerManagedBy(mgr).
 		Named(r.name).
-		For(&kcpcorev1alpha1.LogicalCluster{}).
+		For(&kcpcorev1alpha1.LogicalCluster{}, r.engageOpts).
 		WithOptions(opts).
 		WithEventFilter(predicate.And(predicates...)).
 		Complete(r)

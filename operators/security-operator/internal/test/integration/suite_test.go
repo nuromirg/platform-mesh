@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -30,6 +32,7 @@ import (
 	pmcorev1alpha1 "go.platform-mesh.io/apis/core/v1alpha1"
 	pmprovidersv1alpha1 "go.platform-mesh.io/apis/providers/v1alpha1"
 	platformeshconfig "go.platform-mesh.io/golang-commons/config"
+	platformmeshcontext "go.platform-mesh.io/golang-commons/context"
 	"go.platform-mesh.io/golang-commons/logger"
 	iclient "go.platform-mesh.io/security-operator/internal/client"
 	"go.platform-mesh.io/security-operator/internal/config"
@@ -84,6 +87,15 @@ var (
 	//go:embed yaml/apiexport-providers.platform-mesh.io.yaml
 	ApiExportProvidersYAML []byte
 
+	//go:embed yaml/apiexport-fga.platform-mesh.io.yaml
+	ApiExportFgaYAML []byte
+
+	//go:embed yaml/apiexport-provider-fga.platform-mesh.io.yaml
+	ApiExportProviderFgaYAML []byte
+
+	//go:embed yaml/apibinding-provider-fga-platform-mesh.io.yaml
+	ApiBindingProviderFgaPlatformMeshYAML []byte
+
 	//go:embed yaml/apibinding-core-platform-mesh.io.yaml
 	ApiBindingCorePlatformMeshYAML []byte
 
@@ -102,21 +114,19 @@ var (
 
 func init() {
 	utilruntime.Must(kcpapisv1alpha1.AddToScheme(scheme.Scheme))
+	utilruntime.Must(kcpapisv1alpha2.AddToScheme(scheme.Scheme))
 	utilruntime.Must(kcpcorev1alpha1.AddToScheme(scheme.Scheme))
 	utilruntime.Must(kcptenancyv1alpha1.AddToScheme(scheme.Scheme))
 	utilruntime.Must(pmcorev1alpha1.AddToScheme(scheme.Scheme))
 	utilruntime.Must(pmprovidersv1alpha1.AddToScheme(scheme.Scheme))
-	utilruntime.Must(kcpapisv1alpha2.AddToScheme(scheme.Scheme))
 }
 
 type IntegrationSuite struct {
 	suite.Suite
-	env                              *envtest.Environment
-	kcpConfig                        *rest.Config
-	coreApiExportEndpointSliceConfig *rest.Config
-	providersApiExportEndpointConfig *rest.Config
-	platformMeshSysPath              logicalcluster.Path
-	platformMeshSystemClient         ctrlruntimeclient.Client
+	env                      *envtest.Sharded
+	kcpConfig                *rest.Config
+	platformMeshSysPath      logicalcluster.Path
+	platformMeshSystemClient ctrlruntimeclient.Client
 }
 
 func TestIntegrationSuite(t *testing.T) {
@@ -133,9 +143,24 @@ func (suite *IntegrationSuite) SetupSuite() {
 	require.NoError(suite.T(), err, "failed to create test logger")
 	ctrl.SetLogger(testLogger.Logr())
 
-	suite.env = &envtest.Environment{}
+	// Do not use T.Context() because that context would be cancelled before the cleanup
+	// functions are executed, which would interfere with a clean test teardown.
+	ctx, cancel, _ := platformmeshcontext.StartContext(testLogger, nil, 0)
 
-	suite.kcpConfig, err = suite.env.Start()
+	// Do not use the Suite's teardown to stop kcp, since this would happen
+	// before the test's Cleanup functions are called. Since we use the envtest's
+	// workspace fixture, we have to keep kcp alive until that fixture can clean up.
+	suite.T().Cleanup(func() {
+		cancel(fmt.Errorf("tearing down test suite"))
+	})
+
+	suite.env = &envtest.Sharded{
+		StartTimeout: 2 * time.Minute,
+		StopTimeout:  time.Second * 30,
+		WorkDir:      filepath.Join(os.Getenv("COMPONENT_DIRECTORY"), ".test", "IntegrationSuite"),
+	}
+
+	err = suite.env.Start(ctx)
 	require.NoError(suite.T(), err, "failed to start envtest environment")
 
 	suite.T().Cleanup(func() {
@@ -144,6 +169,8 @@ func (suite *IntegrationSuite) SetupSuite() {
 		}
 		suite.T().Log("kcp server has been stopped")
 	})
+
+	suite.kcpConfig = suite.env.Config()
 
 	suite.setupPlatformMesh(suite.T())
 	suite.setupControllers(defaultCfg, testLogger)
@@ -184,6 +211,17 @@ func (suite *IntegrationSuite) setupPlatformMesh(t *testing.T) {
 		suite.Require().NoError(err)
 	}
 	t.Log("created APIExport 'core.platform-mesh.io' in platform-mesh-system workspace")
+
+	// Same split as production: stores in fga.platform-mesh.io, authorizationmodels in provider-fga.platform-mesh.io.
+	for _, exportYAML := range [][]byte{ApiExportFgaYAML, ApiExportProviderFgaYAML} {
+		var splitExport kcpapisv1alpha1.APIExport
+		suite.Require().NoError(yaml.Unmarshal(exportYAML, &splitExport))
+		err = cli.Cluster(platformMeshSystemClusterPath).Create(ctx, &splitExport)
+		if err != nil && !apierrors.IsAlreadyExists(err) {
+			suite.Require().NoError(err)
+		}
+		t.Logf("created APIExport '%s' in platform-mesh-system workspace", splitExport.Name)
+	}
 
 	// Create providers.platform-mesh.io APIExport
 	var providersApiExport kcpapisv1alpha1.APIExport
@@ -228,32 +266,46 @@ func (suite *IntegrationSuite) setupPlatformMesh(t *testing.T) {
 		return binding.Status.Phase == kcpapisv1alpha2.APIBindingPhaseBound
 	}, 10*time.Second, 200*time.Millisecond, "APIBinding providers.platform-mesh.io should be bound")
 
+	// platform-mesh-system plays the provider in these tests, so it holds the AuthorizationModels.
+	var providerFgaBinding kcpapisv1alpha2.APIBinding
+	suite.Require().NoError(yaml.Unmarshal(ApiBindingProviderFgaPlatformMeshYAML, &providerFgaBinding))
+	err = cli.Cluster(platformMeshSystemClusterPath).Create(ctx, &providerFgaBinding)
+	if err != nil && !apierrors.IsAlreadyExists(err) {
+		suite.Require().NoError(err)
+	}
+	suite.Assert().Eventually(func() bool {
+		var binding kcpapisv1alpha2.APIBinding
+		if err := cli.Cluster(platformMeshSystemClusterPath).Get(ctx, ctrlruntimeclient.ObjectKey{Name: providerFgaBinding.Name}, &binding); err != nil {
+			return false
+		}
+		return binding.Status.Phase == kcpapisv1alpha2.APIBindingPhaseBound
+	}, 10*time.Second, 200*time.Millisecond, "APIBinding provider-fga.platform-mesh.io should be bound")
+
+	// The bind permission check can lag behind the new APIExport when it is on another shard.
+	createWorkspaceType := func(wst *kcptenancyv1alpha1.WorkspaceType) {
+		suite.Require().Eventually(func() bool {
+			err := rootClient.Create(ctx, wst.DeepCopy())
+			return err == nil || apierrors.IsAlreadyExists(err)
+		}, 30*time.Second, 500*time.Millisecond, "WorkspaceType %s should be created", wst.Name)
+	}
+
 	// Create WorkspaceTypes in root workspace
 	var orgWorkspaceType kcptenancyv1alpha1.WorkspaceType
 	suite.Require().NoError(yaml.Unmarshal(WorkspaceTypeOrgYAML, &orgWorkspaceType))
 
-	err = rootClient.Create(ctx, &orgWorkspaceType)
-	if err != nil && !apierrors.IsAlreadyExists(err) {
-		suite.Require().NoError(err)
-	}
+	createWorkspaceType(&orgWorkspaceType)
 	t.Log("created WorkspaceType 'org' in root workspace")
 
 	var orgsWorkspaceType kcptenancyv1alpha1.WorkspaceType
 	suite.Require().NoError(yaml.Unmarshal(WorkspaceTypeOrgsYAML, &orgsWorkspaceType))
 
-	err = rootClient.Create(ctx, &orgsWorkspaceType)
-	if err != nil && !apierrors.IsAlreadyExists(err) {
-		suite.Require().NoError(err)
-	}
+	createWorkspaceType(&orgsWorkspaceType)
 	t.Log("created WorkspaceType 'orgs' in root workspace")
 
 	var accountWorkspaceType kcptenancyv1alpha1.WorkspaceType
 	suite.Require().NoError(yaml.Unmarshal(WorkspaceTypeAccountYAML, &accountWorkspaceType))
 
-	err = rootClient.Create(ctx, &accountWorkspaceType)
-	if err != nil && !apierrors.IsAlreadyExists(err) {
-		suite.Require().NoError(err)
-	}
+	createWorkspaceType(&accountWorkspaceType)
 	t.Log("created WorkspaceType 'account' in root workspace")
 
 	// create :root:orgs ws
@@ -271,45 +323,24 @@ func (suite *IntegrationSuite) setupPlatformMesh(t *testing.T) {
 
 	suite.Require().NotEmpty(endpointSlice.Status.APIExportEndpoints, "APIExportEndpointSlice should have at least one endpoint")
 	suite.Require().NotEqual("", endpointSlice.Status.APIExportEndpoints[0].URL, "APIExportEndpointSlice endpoint URL should not be empty")
-
-	// set up config for core.platform-mesh.io virtual workspace
-	coreCfg := rest.CopyConfig(suite.kcpConfig)
-	coreCfg.Host = endpointSlice.Status.APIExportEndpoints[0].URL
-	suite.coreApiExportEndpointSliceConfig = coreCfg
-	t.Logf("created coreApiExportEndpointSliceConfig with host: %s", suite.coreApiExportEndpointSliceConfig.Host)
-
-	// Wait for providers.platform-mesh.io APIExportEndpointSlice
-	var providersEndpointSlice kcpapisv1alpha1.APIExportEndpointSlice
-	suite.Assert().Eventually(func() bool {
-		err := cli.Cluster(platformMeshSystemClusterPath).Get(ctx, ctrlruntimeclient.ObjectKey{Name: "providers.platform-mesh.io"}, &providersEndpointSlice)
-		if err != nil {
-			return false
-		}
-		return len(providersEndpointSlice.Status.APIExportEndpoints) > 0 && providersEndpointSlice.Status.APIExportEndpoints[0].URL != ""
-	}, 10*time.Second, 200*time.Millisecond, "KCP should automatically create providers.platform-mesh.io APIExportEndpointSlice with populated endpoints")
-
-	suite.Require().NotEmpty(providersEndpointSlice.Status.APIExportEndpoints, "providers APIExportEndpointSlice should have at least one endpoint")
-
-	// set up config for providers.platform-mesh.io virtual workspace
-	providersCfg := rest.CopyConfig(suite.kcpConfig)
-	providersCfg.Host = providersEndpointSlice.Status.APIExportEndpoints[0].URL
-	suite.providersApiExportEndpointConfig = providersCfg
-	t.Logf("created providersApiExportEndpointConfig with host: %s", suite.providersApiExportEndpointConfig.Host)
 }
 
 func (suite *IntegrationSuite) setupControllers(defaultCfg *platformeshconfig.CommonServiceConfig, testLogger *logger.Logger) {
 	ctx := suite.T().Context()
 
-	coreProviderConfig, err := suite.getPlatformMeshSystemConfig(suite.coreApiExportEndpointSliceConfig)
+	pmSystemConfig, err := suite.getPlatformMeshSystemConfig(suite.kcpConfig)
 	suite.Require().NoError(err)
 
-	coreProvider, err := apiexport.New(coreProviderConfig, "core.platform-mesh.io", apiexport.Options{Scheme: scheme.Scheme})
+	coreProvider, err := apiexport.New(pmSystemConfig, "core.platform-mesh.io", apiexport.Options{Scheme: scheme.Scheme})
 	suite.Require().NoError(err)
 
-	providersProviderConfig, err := suite.getPlatformMeshSystemConfig(suite.providersApiExportEndpointConfig)
+	providersProvider, err := apiexport.New(pmSystemConfig, "providers.platform-mesh.io", apiexport.Options{Scheme: scheme.Scheme})
 	suite.Require().NoError(err)
 
-	providersProvider, err := apiexport.New(providersProviderConfig, "providers.platform-mesh.io", apiexport.Options{Scheme: scheme.Scheme})
+	fgaProvider, err := apiexport.New(pmSystemConfig, "fga.platform-mesh.io", apiexport.Options{Scheme: scheme.Scheme})
+	suite.Require().NoError(err)
+
+	providerFgaProvider, err := apiexport.New(pmSystemConfig, "provider-fga.platform-mesh.io", apiexport.Options{Scheme: scheme.Scheme})
 	suite.Require().NoError(err)
 
 	multiProv := multiprovider.New(multiprovider.Options{})
@@ -317,8 +348,12 @@ func (suite *IntegrationSuite) setupControllers(defaultCfg *platformeshconfig.Co
 	suite.Require().NoError(err)
 	err = multiProv.AddProvider(config.ProvidersProviderName, providersProvider)
 	suite.Require().NoError(err)
+	err = multiProv.AddProvider(config.FgaProviderName, fgaProvider)
+	suite.Require().NoError(err)
+	err = multiProv.AddProvider(config.ProviderFgaProviderName, providerFgaProvider)
+	suite.Require().NoError(err)
 
-	mgr, err := mcmanager.New(coreProviderConfig, multiProv, mcmanager.Options{
+	mgr, err := mcmanager.New(pmSystemConfig, multiProv, mcmanager.Options{
 		Scheme: scheme.Scheme,
 	})
 	suite.Require().NoError(err)
@@ -363,7 +398,25 @@ func (suite *IntegrationSuite) createAccount(ctx context.Context, client ctrlrun
 	t.Logf("created account '%s' (type: %s)", accountName, accountType)
 }
 
-func (suite *IntegrationSuite) createAccountInfo(ctx context.Context, accountClient ctrlruntimeclient.Client, accountName, orgName string, accountPath, orgPath logicalcluster.Path, t *testing.T) {
+// createTestStore creates a minimal Store, which must exist before an
+// AuthorizationModel can bind to it.
+func (suite *IntegrationSuite) createTestStore(ctx context.Context, storeClusterClient ctrlruntimeclient.Client, storeName string, t *testing.T) {
+	store := &pmcorev1alpha1.Store{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: storeName,
+		},
+	}
+	err := storeClusterClient.Create(ctx, store)
+	if err != nil && !apierrors.IsAlreadyExists(err) {
+		suite.Require().NoError(err)
+	}
+	t.Logf("created store '%s'", storeName)
+}
+
+// orgClusterID is the raw logical cluster ID the org workspace is stored
+// under (not its path) - must match wherever createTestStore created the
+// Store.
+func (suite *IntegrationSuite) createAccountInfo(ctx context.Context, accountClient ctrlruntimeclient.Client, accountName, orgName, orgClusterID string, accountPath, orgPath logicalcluster.Path, t *testing.T) {
 	accountInfo := &pmcorev1alpha1.AccountInfo{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "account",
@@ -372,7 +425,7 @@ func (suite *IntegrationSuite) createAccountInfo(ctx context.Context, accountCli
 			Organization: pmcorev1alpha1.AccountLocation{
 				Name:               orgName,
 				GeneratedClusterId: orgPath.String(),
-				OriginClusterId:    orgPath.String(),
+				OriginClusterId:    orgClusterID,
 				Path:               orgPath.String(),
 				Type:               pmcorev1alpha1.AccountTypeOrg,
 			},

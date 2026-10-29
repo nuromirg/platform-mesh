@@ -208,6 +208,11 @@ func (a *AuthorizationModelGenerationSubroutine) Finalize(ctx context.Context, o
 	}
 	apiExportClient := apiExportCluster.GetClient()
 
+	modelCluster, err := a.mgr.GetCluster(ctx, config.MultiProviderName(config.ProviderFgaProviderName, bindingToDelete.Status.APIExportClusterName))
+	if err != nil {
+		return subroutines.OK(), fmt.Errorf("getting AuthorizationModel cluster %q: %w", bindingToDelete.Status.APIExportClusterName, err)
+	}
+
 	var apiExport kcpapisv1alpha2.APIExport
 	err = apiExportClient.Get(ctx, types.NamespacedName{Name: bindingToDelete.Spec.Reference.Export.Name}, &apiExport)
 	if err != nil {
@@ -224,14 +229,21 @@ func (a *AuthorizationModelGenerationSubroutine) Finalize(ctx context.Context, o
 		}
 
 		authModelName := toK8sName(resourceSchema.Spec.Group, resourceSchema.Spec.Names.Plural, toDeleteAccountInfo.Spec.Organization.Name)
-		err = apiExportClient.Delete(ctx, &pmcorev1alpha1.AuthorizationModel{
+		err = modelCluster.GetClient().Delete(ctx, &pmcorev1alpha1.AuthorizationModel{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: authModelName,
 			},
 		})
 		if err != nil {
 			if apierrors.IsNotFound(err) {
-				// If the model does not exist, we can skip the deletion.
+				// The model was never created, but a reservation finalizer may
+				// still be on the Store — release it.
+				if derr := deregisterAuthorizationModelFromStore(ctx, a.mgr,
+					config.StoreClusterName(toDeleteAccountInfo.Spec.Organization.OriginClusterId), toDeleteAccountInfo.Spec.Organization.Name,
+					bindingToDelete.Status.APIExportClusterName, authModelName,
+				); derr != nil {
+					return subroutines.OK(), fmt.Errorf("releasing authorization model reservation for %s: %w", authModelName, derr)
+				}
 				log.Info().Msg(fmt.Sprintf("authorization model %s does not exist", authModelName))
 				continue
 			}
@@ -262,10 +274,12 @@ func (a *AuthorizationModelGenerationSubroutine) GetName() string {
 func (a *AuthorizationModelGenerationSubroutine) Process(ctx context.Context, obj ctrlruntimeclient.Object) (subroutines.Result, error) {
 	binding := obj.(*kcpapisv1alpha2.APIBinding)
 
-	internalAPIBindings := []string{"core.platform-mesh.io", "system.platform-mesh.io", "providers.platform-mesh.io"}
+	internalAPIBindings := []string{
+		"core.platform-mesh.io", "system.platform-mesh.io", "providers.platform-mesh.io",
+		"ui.platform-mesh.io", "fga.platform-mesh.io", "provider-fga.platform-mesh.io",
+	}
 
 	if slices.Contains(internalAPIBindings, binding.Spec.Reference.Export.Name) || strings.HasSuffix(binding.Spec.Reference.Export.Name, "kcp.io") {
-		// If the APIExport is the core.platform-mesh.io, system.platform-mesh.io, providers.platform-mesh.io we can skip the model generation.
 		return subroutines.OK(), nil
 	}
 
@@ -285,28 +299,39 @@ func (a *AuthorizationModelGenerationSubroutine) Process(ctx context.Context, ob
 		return subroutines.OK(), fmt.Errorf("getting APIExport cluster: %w", err)
 	}
 
+	modelCluster, err := a.mgr.GetCluster(ctx, config.MultiProviderName(config.ProviderFgaProviderName, binding.Status.APIExportClusterName))
+	if err != nil {
+		return subroutines.OK(), fmt.Errorf("getting AuthorizationModel cluster: %w", err)
+	}
+
 	var apiExport kcpapisv1alpha2.APIExport
 	err = apiExportCluster.GetClient().Get(ctx, types.NamespacedName{Name: binding.Spec.Reference.Export.Name}, &apiExport)
 	if err != nil {
 		return subroutines.OK(), fmt.Errorf("getting APIExport: %w", err)
 	}
 
-	providerCluster, err := a.mgr.GetCluster(ctx, config.MultiProviderName(config.ProvidersProviderName, binding.Status.APIExportClusterName))
-	if err != nil {
-		return subroutines.OK(), fmt.Errorf("getting provider cluster: %w", err)
-	}
-
-	var providerPermissionsList pmprovidersv1alpha1.ProviderPermissionsList
-	err = providerCluster.GetClient().List(ctx, &providerPermissionsList)
-	if err != nil {
-		return subroutines.OK(), fmt.Errorf("listing ProviderPermissions: %w", err)
-	}
-
+	var providerClient ctrlruntimeclient.Client
 	var providerPermissions *pmprovidersv1alpha1.ProviderPermissions
-	for i := range providerPermissionsList.Items {
-		if providerPermissionsList.Items[i].Spec.APIExport.Ref.Name == apiExport.Name {
-			providerPermissions = &providerPermissionsList.Items[i]
-			break
+
+	// A self-bound export has no provider workspace and uses the template defaults. Every
+	// other export must resolve, or the model would lose the provider's permission overrides.
+	if binding.Status.APIExportClusterName != logicalcluster.From(binding).String() {
+		providerCluster, err := a.mgr.GetCluster(ctx, config.MultiProviderName(config.ProvidersProviderName, binding.Status.APIExportClusterName))
+		if err != nil {
+			return subroutines.OK(), fmt.Errorf("getting provider cluster: %w", err)
+		}
+		providerClient = providerCluster.GetClient()
+
+		var providerPermissionsList pmprovidersv1alpha1.ProviderPermissionsList
+		if err := providerClient.List(ctx, &providerPermissionsList); err != nil {
+			return subroutines.OK(), fmt.Errorf("listing ProviderPermissions: %w", err)
+		}
+
+		for i := range providerPermissionsList.Items {
+			if providerPermissionsList.Items[i].Spec.APIExport.Ref.Name == apiExport.Name {
+				providerPermissions = &providerPermissionsList.Items[i]
+				break
+			}
 		}
 	}
 
@@ -352,13 +377,24 @@ func (a *AuthorizationModelGenerationSubroutine) Process(ctx context.Context, ob
 			return subroutines.OK(), fmt.Errorf("executing model template: %w", err)
 		}
 
+		modelName := toK8sName(resourceSchema.Spec.Group, resourceSchema.Spec.Names.Plural, accountInfo.Spec.Organization.Name)
+
+		// Reserve the model on its Store before creating it, so the bind fails
+		// atomically instead of racing an org deletion.
+		if err := registerAuthorizationModelWithStore(ctx, a.mgr,
+			config.StoreClusterName(accountInfo.Spec.Organization.OriginClusterId), accountInfo.Spec.Organization.Name,
+			binding.Status.APIExportClusterName, modelName,
+		); err != nil {
+			return subroutines.OK(), fmt.Errorf("registering authorization model %s with store: %w", modelName, err)
+		}
+
 		model := pmcorev1alpha1.AuthorizationModel{
 			ObjectMeta: metav1.ObjectMeta{
-				Name: toK8sName(resourceSchema.Spec.Group, resourceSchema.Spec.Names.Plural, accountInfo.Spec.Organization.Name),
+				Name: modelName,
 			},
 		}
 
-		_, err = controllerutil.CreateOrUpdate(ctx, apiExportCluster.GetClient(), &model, func() error {
+		_, err = controllerutil.CreateOrUpdate(ctx, modelCluster.GetClient(), &model, func() error {
 			model.Spec = pmcorev1alpha1.AuthorizationModelSpec{
 				Model: buffer.String(),
 				StoreRef: pmcorev1alpha1.WorkspaceStoreRef{
@@ -384,7 +420,7 @@ func (a *AuthorizationModelGenerationSubroutine) Process(ctx context.Context, ob
 			Message:            "ProviderPermissions successfully applied to all AuthorizationModels",
 		})
 
-		if err := providerCluster.GetClient().Status().Update(ctx, providerPermissions); err != nil {
+		if err := providerClient.Status().Update(ctx, providerPermissions); err != nil {
 			return subroutines.OK(), fmt.Errorf("updating ProviderPermissions status: %w", err)
 		}
 	}

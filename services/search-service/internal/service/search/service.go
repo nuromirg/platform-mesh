@@ -18,6 +18,7 @@ package search
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -26,7 +27,25 @@ import (
 
 	"go.platform-mesh.io/golang-commons/logger"
 	"go.platform-mesh.io/search-service/internal/observability"
+	"go.platform-mesh.io/search-service/internal/stringset"
 )
+
+// logPartialPage records a page that covers fewer shards than were queried.
+// OpenSearch reports this with a 200, so without the warning a mapping conflict
+// in one index looks exactly like a complete result with a smaller total.
+func logPartialPage(log *logger.Logger, page OpenSearchPage, op string) {
+	if !page.Partial() {
+		return
+	}
+
+	log.Warn().
+		Str("operation", op).
+		Bool("timedOut", page.TimedOut).
+		Int("shardsTotal", page.ShardsTotal).
+		Int("shardsFailed", page.ShardsFailed).
+		Strs("shardFailures", page.ShardFailures).
+		Msg("OpenSearch returned a partial result; hits and totalCount are incomplete")
+}
 
 type ServiceConfig struct {
 	DefaultLimit   int
@@ -102,6 +121,7 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) (SearchResponse
 	}
 	resource := strings.TrimSpace(req.Resource)
 	filters := normalizeFilters(req.Filters)
+	fgaRole := strings.TrimSpace(req.FGARole)
 	if resource == "" && len(filters) > 0 {
 		return SearchResponse{}, fmt.Errorf("%w: filters require a resource", ErrInvalidRequest)
 	}
@@ -118,6 +138,7 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) (SearchResponse
 		limit = s.cfg.MaxLimit
 	}
 
+	pageMode := req.Cursor == "" && req.Page > 0
 	resultOffset := 0
 	if req.Cursor == "" {
 		if req.Page < 0 {
@@ -141,7 +162,7 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) (SearchResponse
 	}
 
 	qHash := queryHash(query)
-	fHash := filtersHash(filters)
+	fHash := cursorFiltersHash(filters, fgaRole)
 	var searchAfter []any
 	if req.Cursor != "" {
 		decoded, err := DecodeCursor(req.Cursor)
@@ -153,6 +174,32 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) (SearchResponse
 			return SearchResponse{}, err
 		}
 		searchAfter = decoded.SearchAfter
+	}
+
+	accountFGAObjects, err := s.authorizer.ListAccessibleAccounts(ctx, org, user, fgaRole)
+	s.metrics.AddOpenFGACalls(1)
+	if err != nil {
+		if fgaRole != "" && errors.Is(err, ErrFGARelationNotFound) {
+			return SearchResponse{}, fmt.Errorf(
+				"%w: relation %q is not defined in the OpenFGA account schema",
+				ErrInvalidRequest,
+				fgaRole,
+			)
+		}
+		log.Error().
+			Err(err).
+			Str("searchmode", mode).
+			Str("organization", org).
+			Str("queryHash", qHash).
+			Msg("failed to list accessible accounts with OpenFGA")
+		return SearchResponse{}, backendErr(ErrAuthzBackend, "list accessible accounts", err)
+	}
+	if len(accountFGAObjects) == 0 {
+		if pageMode {
+			zero := 0
+			return SearchResponse{Results: []SearchHit{}, TotalCount: &zero}, nil
+		}
+		return SearchResponse{Results: []SearchHit{}}, nil
 	}
 
 	var (
@@ -167,7 +214,7 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) (SearchResponse
 		indexRef, err := s.resolver.ResolveIndex(ctx, org, resource)
 		if err != nil {
 			log.Error().Err(err).Str("searchmode", mode).Str("org", org).Str("resource", resource).Msg("failed to resolve search index")
-			return SearchResponse{}, fmt.Errorf("%w: resolve search index: %v", ErrBackend, err)
+			return SearchResponse{}, backendErr(ErrSearchBackend, "resolve search index", err)
 		}
 
 		if err := validateFiltersAllowed(filters, indexRef.FilterableFields); err != nil {
@@ -179,19 +226,19 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) (SearchResponse
 
 		indices = []string{indexRef.IndexName}
 		resourceByIndex = map[string]string{indexRef.IndexName: indexRef.Resource}
-		searchFields = searchableFields(indexRef.DefaultFields)
-		semanticFields = semanticSearchFields(indexRef.SemanticFields)
+		searchFields = stringset.DedupeSorted(indexRef.DefaultFields)
+		semanticFields = stringset.DedupeSorted(indexRef.SemanticFields)
 		filterQuery = filters
 	} else {
 		indexRefs, err := s.resolver.ListIndices(ctx, org)
 		if err != nil {
 			log.Error().Err(err).Str("searchmode", mode).Str("org", org).Msg("failed to list search indices")
-			return SearchResponse{}, fmt.Errorf("%w: list search indices: %v", ErrBackend, err)
+			return SearchResponse{}, backendErr(ErrSearchBackend, "list search indices", err)
 		}
 
 		indices, resourceByIndex = indexLookup(indexRefs)
 		if len(indices) == 0 {
-			return SearchResponse{}, fmt.Errorf("%w: no active search indices for org %q", ErrBackend, org)
+			return SearchResponse{}, fmt.Errorf("%w: org %q", ErrIndexUnavailable, org)
 		}
 		searchFields = searchableFieldsForRefs(indexRefs)
 	}
@@ -209,29 +256,33 @@ func (s *Service) Search(ctx context.Context, req SearchRequest) (SearchResponse
 	var nextSearchAfter []any
 	var totalScanned int
 	var authorizedHits int
+	var totalCount int
 	var exhausted bool
 
 outer:
 	for len(results) < limit {
 		page, err := s.searcher.Search(ctx, OpenSearchQuery{
-			Indices:        indices,
-			Query:          query,
-			Mode:           mode,
-			Fields:         searchFields,
-			SemanticFields: semanticFields,
-			Filters:        filterQuery,
-			Size:           s.cfg.FetchBatchSize,
-			SearchAfter:    searchAfter,
+			Indices:           indices,
+			Query:             query,
+			Mode:              mode,
+			Fields:            searchFields,
+			SemanticFields:    semanticFields,
+			Filters:           filterQuery,
+			AccountFGAObjects: accountFGAObjects,
+			Size:              s.cfg.FetchBatchSize,
+			SearchAfter:       searchAfter,
 		})
 		s.metrics.AddOpenSearchCalls(1)
 		if err != nil {
 			log.Error().Err(err).Msg("failed to query OpenSearch")
-			return SearchResponse{}, fmt.Errorf("%w: query OpenSearch: %v", ErrBackend, err)
+			return SearchResponse{}, backendErr(ErrSearchBackend, "query OpenSearch", err)
 		}
+		logPartialPage(log, page, "search")
 		if len(page.Hits) == 0 {
 			exhausted = true
 			break
 		}
+		totalCount = page.TotalCount
 
 		authz, err := s.authorizer.FilterAuthorized(ctx, AuthorizationRequest{
 			Organization: org,
@@ -248,7 +299,7 @@ outer:
 				Str("resource", resource).
 				Int("scannedHits", totalScanned).
 				Msg("failed to authorize search hits with OpenFGA")
-			return SearchResponse{}, fmt.Errorf("%w: filter authorization: %v", ErrBackend, err)
+			return SearchResponse{}, backendErr(ErrAuthzBackend, "filter authorization", err)
 		}
 		s.metrics.AddOpenFGACalls(authz.Calls)
 		s.metrics.AddDroppedMissingContext(authz.DroppedMissingContext)
@@ -283,6 +334,12 @@ outer:
 		}
 		searchAfter = page.Hits[len(page.Hits)-1].Sort
 	}
+	if pageMode {
+		return SearchResponse{
+			Results:    results,
+			TotalCount: &totalCount,
+		}, nil
+	}
 
 	var nextCursor *string
 	if !exhausted && len(nextSearchAfter) > 0 {
@@ -314,7 +371,7 @@ func (s *Service) ListResources(ctx context.Context, req SearchResourcesRequest)
 
 	refs, err := s.resolver.ListIndices(ctx, org)
 	if err != nil {
-		return SearchResourcesResponse{}, fmt.Errorf("%w: list search indices: %v", ErrBackend, err)
+		return SearchResourcesResponse{}, backendErr(ErrSearchBackend, "list search indices", err)
 	}
 
 	resources := make([]SearchResource, 0, len(refs))
@@ -326,9 +383,9 @@ func (s *Service) ListResources(ctx context.Context, req SearchResourcesRequest)
 		}
 		byResource[resource] = SearchResource{
 			Resource:         resource,
-			DefaultFields:    dedupeNonEmpty(ref.DefaultFields),
-			FilterableFields: dedupeNonEmpty(ref.FilterableFields),
-			SemanticFields:   dedupeNonEmpty(ref.SemanticFields),
+			DefaultFields:    stringset.DedupeSorted(ref.DefaultFields),
+			FilterableFields: stringset.DedupeSorted(ref.FilterableFields),
+			SemanticFields:   stringset.DedupeSorted(ref.SemanticFields),
 		}
 	}
 
@@ -372,7 +429,7 @@ func (s *Service) FilterValues(ctx context.Context, req FilterValuesRequest) (Fi
 
 	indexRef, err := s.resolver.ResolveIndex(ctx, org, resource)
 	if err != nil {
-		return FilterValuesResponse{}, fmt.Errorf("%w: resolve search index: %v", ErrBackend, err)
+		return FilterValuesResponse{}, backendErr(ErrSearchBackend, "resolve search index", err)
 	}
 
 	allowed := fieldSet(indexRef.FilterableFields)
@@ -386,7 +443,15 @@ func (s *Service) FilterValues(ctx context.Context, req FilterValuesRequest) (Fi
 	}
 
 	query := strings.TrimSpace(req.Query)
-	searchFields := searchableFields(indexRef.DefaultFields)
+	searchFields := stringset.DedupeSorted(indexRef.DefaultFields)
+	accountFGAObjects, err := s.authorizer.ListAccessibleAccounts(ctx, org, user, "")
+	s.metrics.AddOpenFGACalls(1)
+	if err != nil {
+		return FilterValuesResponse{}, backendErr(ErrAuthzBackend, "list accessible accounts", err)
+	}
+	if len(accountFGAObjects) == 0 {
+		return FilterValuesResponse{Values: []string{}}, nil
+	}
 
 	searchAfter := []any(nil)
 	totalScanned := 0
@@ -396,17 +461,19 @@ func (s *Service) FilterValues(ctx context.Context, req FilterValuesRequest) (Fi
 outer:
 	for len(values) < limit {
 		page, err := s.searcher.Search(ctx, OpenSearchQuery{
-			Indices:     []string{indexRef.IndexName},
-			Query:       query,
-			Fields:      searchFields,
-			Filters:     filters,
-			Size:        s.cfg.FetchBatchSize,
-			SearchAfter: searchAfter,
+			Indices:           []string{indexRef.IndexName},
+			Query:             query,
+			Fields:            searchFields,
+			Filters:           filters,
+			AccountFGAObjects: accountFGAObjects,
+			Size:              s.cfg.FetchBatchSize,
+			SearchAfter:       searchAfter,
 		})
 		s.metrics.AddOpenSearchCalls(1)
 		if err != nil {
-			return FilterValuesResponse{}, fmt.Errorf("%w: query OpenSearch: %v", ErrBackend, err)
+			return FilterValuesResponse{}, backendErr(ErrSearchBackend, "query OpenSearch", err)
 		}
+		logPartialPage(logger.LoadLoggerFromContext(ctx), page, "filter values")
 		if len(page.Hits) == 0 {
 			break
 		}
@@ -418,7 +485,7 @@ outer:
 			Hits:         page.Hits,
 		})
 		if err != nil {
-			return FilterValuesResponse{}, fmt.Errorf("%w: filter authorization: %v", ErrBackend, err)
+			return FilterValuesResponse{}, backendErr(ErrAuthzBackend, "filter authorization", err)
 		}
 		s.metrics.AddOpenFGACalls(authz.Calls)
 		s.metrics.AddDroppedMissingContext(authz.DroppedMissingContext)
@@ -562,21 +629,13 @@ func resolveHitResource(hit OpenSearchHit, requestedResource string, byIndex map
 	return strings.TrimSpace(stringFromMap(hit.Source, "resource"))
 }
 
-func searchableFields(defaultFields []string) []string {
-	return dedupeNonEmpty(defaultFields)
-}
-
 func searchableFieldsForRefs(refs []SearchIndexRef) []string {
 	fields := make([]string, 0, len(refs)*2)
 	for _, ref := range refs {
 		fields = append(fields, ref.DefaultFields...)
 	}
 
-	return dedupeNonEmpty(fields)
-}
-
-func semanticSearchFields(fields []string) []string {
-	return dedupeNonEmpty(fields)
+	return stringset.DedupeSorted(fields)
 }
 
 func normalizeFilters(filters map[string][]string) map[string][]string {
@@ -639,25 +698,6 @@ func fieldSet(values []string) map[string]struct{} {
 			out[trimmed] = struct{}{}
 		}
 	}
-
-	return out
-}
-
-func dedupeNonEmpty(values []string) []string {
-	out := make([]string, 0, len(values))
-	seen := make(map[string]struct{}, len(values))
-	for _, value := range values {
-		trimmed := strings.TrimSpace(value)
-		if trimmed == "" {
-			continue
-		}
-		if _, ok := seen[trimmed]; ok {
-			continue
-		}
-		seen[trimmed] = struct{}{}
-		out = append(out, trimmed)
-	}
-	slices.Sort(out)
 
 	return out
 }

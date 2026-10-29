@@ -25,6 +25,7 @@ import (
 type WebhookConfig struct {
 	CertDir                    string
 	ClusterKey                 string
+	ClusterPathKey             string
 	AllowedNonResourcePrefixes []string
 
 	// CacheMissMaxRetries is the maximum number of retries per key before stopping.
@@ -44,7 +45,8 @@ type Config struct {
 
 	Webhook WebhookConfig
 
-	APIExportEndpointSliceName string
+	APIExportEndpointSliceName      string
+	StoreAPIExportEndpointSliceName string
 }
 
 func New() *Config {
@@ -55,6 +57,7 @@ func New() *Config {
 		Webhook: WebhookConfig{
 			CertDir:                    "config",
 			ClusterKey:                 "authorization.kubernetes.io/cluster-name",
+			ClusterPathKey:             "authorization.kubernetes.io/cluster-path",
 			AllowedNonResourcePrefixes: []string{"/api", "/openapi", "/version"},
 			CacheMissMaxRetries:        1,
 			CacheMissTTL:               5 * time.Minute,
@@ -62,7 +65,8 @@ func New() *Config {
 			CacheMissRetryAfter:        1 * time.Second,
 		},
 
-		APIExportEndpointSliceName: "core.platform-mesh.io",
+		APIExportEndpointSliceName:      "core.platform-mesh.io",
+		StoreAPIExportEndpointSliceName: "fga.platform-mesh.io",
 	}
 }
 
@@ -72,10 +76,12 @@ func (cfg *Config) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&cfg.OpenFGAAddr, "openfga-addr", cfg.OpenFGAAddr, "Set the OpenFGA address")
 	fs.StringVar(&cfg.Webhook.CertDir, "webhook-cert-dir", cfg.Webhook.CertDir, "Set the webhook certificate directory")
 	fs.StringVar(&cfg.Webhook.ClusterKey, "webhook-cluster-key", cfg.Webhook.ClusterKey, "Set the webhook cluster key")
+	fs.StringVar(&cfg.Webhook.ClusterPathKey, "webhook-cluster-path-key", cfg.Webhook.ClusterPathKey, "Set the webhook cluster path key for batch authorization")
 	fs.StringSliceVar(&cfg.Webhook.AllowedNonResourcePrefixes, "webhook-allowed-nonresource-prefixes", cfg.Webhook.AllowedNonResourcePrefixes, "Set the allowed non-resource prefixes for the webhook")
 	fs.UintVar(&cfg.Webhook.CacheMissMaxRetries, "webhook-cache-miss-max-retries", cfg.Webhook.CacheMissMaxRetries, "Maximum number of retries per cluster on cache miss")
 	fs.DurationVar(&cfg.Webhook.CacheMissTTL, "webhook-cache-miss-ttl", cfg.Webhook.CacheMissTTL, "Duration after which cache miss count resets for a cluster")
 	fs.DurationVar(&cfg.Webhook.CacheMissCleanupInterval, "webhook-cache-miss-cleanup-interval", cfg.Webhook.CacheMissCleanupInterval, "Interval at which cache miss keys are checked for expiration")
 	fs.DurationVar(&cfg.Webhook.CacheMissRetryAfter, "webhook-cache-miss-retry-after", cfg.Webhook.CacheMissRetryAfter, "Delay before retrying on cache miss")
 	fs.StringVar(&cfg.APIExportEndpointSliceName, "kcp-api-export-endpoint-slice-name", cfg.APIExportEndpointSliceName, "Set the kcp API export endpoint slice name")
+	fs.StringVar(&cfg.StoreAPIExportEndpointSliceName, "kcp-store-api-export-endpoint-slice-name", cfg.StoreAPIExportEndpointSliceName, "Set the kcp API export endpoint slice name that serves Stores")
 }

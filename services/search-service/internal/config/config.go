@@ -24,6 +24,8 @@ import (
 	"github.com/spf13/pflag"
 )
 
+const defaultUserClaim = "email"
+
 type OpenSearchConfig struct {
 	URL      string
 	Username string
@@ -33,15 +35,18 @@ type OpenSearchConfig struct {
 }
 
 type OpenFGAConfig struct {
-	GRPCAddr string
+	GRPCAddr    string
+	ObjectType  string
+	DefaultRole string
 }
 
 type SearchIndexConfig struct {
-	WorkspacePath    string
-	OrgWorkspacePath string
-	Group            string
-	Version          string
-	Resource         string
+	WorkspacePath            string
+	OrgWorkspacePath         string
+	TokenReviewWorkspacePath string
+	Group                    string
+	Version                  string
+	Resource                 string
 }
 
 type SearchConfig struct {
@@ -54,6 +59,8 @@ type SearchConfig struct {
 type ServiceConfig struct {
 	Port                int
 	LocalDevelopmentOrg string
+	UserClaim           string
+	BatchSize           int
 	OpenSearch          OpenSearchConfig
 	OpenFGA             OpenFGAConfig
 	SearchIndex         SearchIndexConfig
@@ -64,6 +71,7 @@ func NewServiceConfig() *ServiceConfig {
 	return &ServiceConfig{
 		Port:                8080,
 		LocalDevelopmentOrg: localDevelopmentOrgFromEnv(),
+		UserClaim:           defaultUserClaim,
 		OpenSearch: OpenSearchConfig{
 			URL:      "http://opensearch.platform-mesh-system.svc.cluster.local:9200",
 			Username: os.Getenv("OPENSEARCH_USERNAME"),
@@ -72,14 +80,17 @@ func NewServiceConfig() *ServiceConfig {
 			Timeout:  10 * time.Second,
 		},
 		OpenFGA: OpenFGAConfig{
-			GRPCAddr: "openfga:8081",
+			GRPCAddr:    "openfga:8081",
+			ObjectType:  "core_platform-mesh_io_account",
+			DefaultRole: "member",
 		},
 		SearchIndex: SearchIndexConfig{
-			WorkspacePath:    "root:providers:search",
-			OrgWorkspacePath: "root:orgs",
-			Group:            "search.platform-mesh.io",
-			Version:          "v1alpha1",
-			Resource:         "searchindexes",
+			WorkspacePath:            "root:providers:search",
+			OrgWorkspacePath:         "root:orgs",
+			TokenReviewWorkspacePath: "root:orgs",
+			Group:                    "search.platform-mesh.io",
+			Version:                  "v1alpha1",
+			Resource:                 "searchindices",
 		},
 		Search: SearchConfig{
 			DefaultLimit:   20,
@@ -87,12 +98,14 @@ func NewServiceConfig() *ServiceConfig {
 			FetchBatchSize: 100,
 			MaxScannedHits: 1000,
 		},
+		BatchSize: 50,
 	}
 }
 
 func (c *ServiceConfig) AddFlags(fs *pflag.FlagSet) {
 	fs.IntVar(&c.Port, "port", c.Port, "Set the service port")
 	fs.StringVar(&c.LocalDevelopmentOrg, "local-development-org", c.LocalDevelopmentOrg, "Organization to use when request host is localhost")
+	fs.StringVar(&c.UserClaim, "user-claim", c.UserClaim, "Set the ID token claim used as the OpenFGA user")
 
 	fs.StringVar(&c.OpenSearch.URL, "opensearch-url", c.OpenSearch.URL, "Set OpenSearch URL")
 	fs.StringVar(&c.OpenSearch.Username, "opensearch-username", c.OpenSearch.Username, "Set OpenSearch username")
@@ -101,13 +114,17 @@ func (c *ServiceConfig) AddFlags(fs *pflag.FlagSet) {
 	fs.DurationVar(&c.OpenSearch.Timeout, "opensearch-timeout", c.OpenSearch.Timeout, "Set OpenSearch HTTP timeout")
 
 	fs.StringVar(&c.OpenFGA.GRPCAddr, "openfga-grpc-addr", c.OpenFGA.GRPCAddr, "Set OpenFGA gRPC address")
+	fs.StringVar(&c.OpenFGA.ObjectType, "openfga-object-type", c.OpenFGA.ObjectType, "Set the OpenFGA object type for accounts")
+	fs.StringVar(&c.OpenFGA.DefaultRole, "openfga-default-role", c.OpenFGA.DefaultRole, "Set the OpenFGA default role for account access")
 
 	fs.StringVar(&c.SearchIndex.WorkspacePath, "searchindex-workspace-path", c.SearchIndex.WorkspacePath, "Workspace path for SearchIndex resources")
 	fs.StringVar(&c.SearchIndex.OrgWorkspacePath, "searchindex-org-workspace-path", c.SearchIndex.OrgWorkspacePath, "Workspace path for organization workspaces")
+	fs.StringVar(&c.SearchIndex.TokenReviewWorkspacePath, "searchindex-token-review-workspace-path", c.SearchIndex.TokenReviewWorkspacePath, "Workspace path used for KCP TokenReview JWT validation")
 	fs.StringVar(&c.SearchIndex.Group, "searchindex-group", c.SearchIndex.Group, "SearchIndex API group")
 	fs.StringVar(&c.SearchIndex.Version, "searchindex-version", c.SearchIndex.Version, "SearchIndex API version")
 	fs.StringVar(&c.SearchIndex.Resource, "searchindex-resource", c.SearchIndex.Resource, "SearchIndex API resource plural")
 
+	fs.IntVar(&c.BatchSize, "batch-size", c.BatchSize, "Batch size for Authorization requests")
 	fs.IntVar(&c.Search.DefaultLimit, "search-default-limit", c.Search.DefaultLimit, "Default search result limit")
 	fs.IntVar(&c.Search.MaxLimit, "search-max-limit", c.Search.MaxLimit, "Maximum search result limit")
 	fs.IntVar(&c.Search.FetchBatchSize, "search-fetch-batch-size", c.Search.FetchBatchSize, "Batch size for OpenSearch fetches")

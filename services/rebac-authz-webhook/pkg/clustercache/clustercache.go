@@ -49,6 +49,7 @@ type ClusterInfo struct {
 type Provider interface {
 	mcmanager.Runnable
 	Get(clusterName multicluster.ClusterName) (ClusterInfo, bool)
+	ClusterName(clusterPath string) (multicluster.ClusterName, bool)
 }
 
 var defaultBackoff = wait.Backoff{
@@ -59,20 +60,34 @@ var defaultBackoff = wait.Backoff{
 	Cap:      5 * time.Minute,
 }
 
+// ClusterGetter returns a cluster by name or kcp path.
+type ClusterGetter interface {
+	Get(ctx context.Context, clusterName multicluster.ClusterName) (cluster.Cluster, error)
+}
+
+type managerClusters struct{ mgr mcmanager.Manager }
+
+func (m managerClusters) Get(ctx context.Context, clusterName multicluster.ClusterName) (cluster.Cluster, error) {
+	return m.mgr.GetCluster(ctx, clusterName)
+}
+
 type resolver struct {
 	cl     cluster.Cluster
 	cancel context.CancelFunc
 }
 
 type clusterCache struct {
-	cacheLock sync.RWMutex
-	cache     map[multicluster.ClusterName]ClusterInfo
+	cacheLock      sync.RWMutex
+	cache          map[multicluster.ClusterName]ClusterInfo
+	clustersByPath map[string]multicluster.ClusterName
 
 	resolversLock sync.Mutex
 	resolvers     map[multicluster.ClusterName]*resolver
 
 	mgr     mcmanager.Manager
 	backoff wait.Backoff
+	// storeClusters serves Stores, which are exported by fga.platform-mesh.io and not by the manager's export.
+	storeClusters ClusterGetter
 }
 
 type Option func(*clusterCache)
@@ -81,12 +96,18 @@ func WithBackoff(b wait.Backoff) Option {
 	return func(c *clusterCache) { c.backoff = b }
 }
 
+func WithStoreClusters(g ClusterGetter) Option {
+	return func(c *clusterCache) { c.storeClusters = g }
+}
+
 func New(mgr mcmanager.Manager, opts ...Option) (*clusterCache, error) {
 	c := &clusterCache{
-		cache:     make(map[multicluster.ClusterName]ClusterInfo),
-		resolvers: make(map[multicluster.ClusterName]*resolver),
-		mgr:       mgr,
-		backoff:   defaultBackoff,
+		cache:          make(map[multicluster.ClusterName]ClusterInfo),
+		clustersByPath: make(map[string]multicluster.ClusterName),
+		resolvers:      make(map[multicluster.ClusterName]*resolver),
+		mgr:            mgr,
+		backoff:        defaultBackoff,
+		storeClusters:  managerClusters{mgr: mgr},
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -99,6 +120,13 @@ func (c *clusterCache) Get(clusterName multicluster.ClusterName) (ClusterInfo, b
 	defer c.cacheLock.RUnlock()
 	val, ok := c.cache[clusterName]
 	return val, ok
+}
+
+func (c *clusterCache) ClusterName(clusterPath string) (multicluster.ClusterName, bool) {
+	c.cacheLock.RLock()
+	defer c.cacheLock.RUnlock()
+	clusterName, ok := c.clustersByPath[clusterPath]
+	return clusterName, ok
 }
 
 func (c *clusterCache) Engage(ctx context.Context, name multicluster.ClusterName, cl cluster.Cluster) error {
@@ -200,7 +228,7 @@ func (c *clusterCache) tryResolve(ctx context.Context, name multicluster.Cluster
 		Version: "v1alpha1",
 		Kind:    "Store",
 	})
-	orgsCluster, err := c.mgr.GetCluster(ctx, "root:orgs")
+	orgsCluster, err := c.storeClusters.Get(ctx, "root:orgs")
 	if err != nil {
 		return false, err
 	}
@@ -248,6 +276,7 @@ func (c *clusterCache) tryResolve(ctx context.Context, name multicluster.Cluster
 		AccountName:     accountName,
 		ParentClusterID: parentClusterID,
 	}
+	c.clustersByPath[annotationPath] = name
 	c.cacheLock.Unlock()
 
 	klog.V(5).InfoS("Cached cluster info",

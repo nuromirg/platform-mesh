@@ -54,6 +54,12 @@ func (NoopValidator) Validate(_ context.Context, _ string) (bool, error) {
 
 const maxCacheSize = 10000
 
+// negativeCacheTTL bounds how long a denied (authenticated:false) verdict may
+// be served from cache. Deny verdicts are often transient (token not yet
+// propagated, clock skew, revoked-then-reissued sessions) and must not stick
+// for the full positive cacheTTL. Kept as a var so tests can shrink it.
+var negativeCacheTTL = 2 * time.Second
+
 // TokenReviewValidator validates tokens via the Kubernetes TokenReview API.
 type TokenReviewValidator struct {
 	clientset kubernetes.Interface
@@ -117,22 +123,48 @@ func NewTokenReviewValidatorFromClientset(cs kubernetes.Interface, cacheTTL time
 	}
 }
 
-func (v *TokenReviewValidator) Validate(ctx context.Context, token string) (bool, error) {
-	key := hashToken(token)
-	if v.cache != nil {
-		if item := v.cache.Get(key); item != nil {
-			if v.metrics != nil {
-				labelResult := metrics.ResultDenied
-				if item.Value() {
-					labelResult = metrics.ResultAllowed
-				}
-				v.metrics.RecordCacheHit(labelResult)
-			}
-			return item.Value(), nil
-		}
+func (v *TokenReviewValidator) cachedVerdict(ctx context.Context, key string) (bool, bool) {
+	if v.cache == nil {
+		return false, false
 	}
 
+	item := v.cache.Get(key)
+	if item == nil {
+		return false, false
+	}
+
+	authenticated := item.Value()
+	if v.metrics != nil {
+		labelResult := metrics.ResultDenied
+		if authenticated {
+			labelResult = metrics.ResultAllowed
+		}
+		v.metrics.RecordCacheHit(labelResult)
+	}
+	if !authenticated {
+		log.FromContext(ctx).V(1).Info("token denied (cached TokenReview verdict)")
+	}
+	return authenticated, true
+}
+
+func (v *TokenReviewValidator) Validate(ctx context.Context, token string) (bool, error) {
+	key := hashToken(token)
+	if result, ok := v.cachedVerdict(ctx, key); ok {
+		return result, nil
+	}
+
+	return v.validateAfterCacheMiss(ctx, token, key)
+}
+
+func (v *TokenReviewValidator) validateAfterCacheMiss(ctx context.Context, token, key string) (bool, error) {
 	result, err, _ := v.inflight.Do(key, func() (any, error) {
+		// A caller can observe a cache miss and then reach singleflight after a
+		// previous flight has populated the cache and completed. Recheck here so
+		// that stale miss does not trigger another TokenReview API call.
+		if result, ok := v.cachedVerdict(ctx, key); ok {
+			return result, nil
+		}
+
 		start := time.Now()
 		tr, err := v.clientset.AuthenticationV1().TokenReviews().Create(ctx, &authenticationv1.TokenReview{
 			Spec: authenticationv1.TokenReviewSpec{Token: token},
@@ -145,9 +177,20 @@ func (v *TokenReviewValidator) Validate(ctx context.Context, token string) (bool
 			return false, err
 		}
 
+		if !tr.Status.Authenticated {
+			log.FromContext(ctx).Info("TokenReview denied token",
+				"error", tr.Status.Error, "cache", "fresh")
+		}
+
 		if v.cache != nil {
 			itemTTL := ttlcache.DefaultTTL
-			if exp := tokenExpiry(token); !exp.IsZero() {
+			if !tr.Status.Authenticated {
+				// Deny verdicts get a short TTL: enough to absorb request
+				// bursts (singleflight already dedupes concurrent ones), but
+				// short enough that a token that becomes valid (propagation
+				// delay, clock skew) is not rejected for the full cacheTTL.
+				itemTTL = min(v.cacheTTL, negativeCacheTTL)
+			} else if exp := tokenExpiry(token); !exp.IsZero() {
 				if remaining := time.Until(exp); remaining > 0 {
 					itemTTL = min(v.cacheTTL, remaining)
 				}

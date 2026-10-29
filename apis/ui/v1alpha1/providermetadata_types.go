@@ -38,12 +38,20 @@ type Image struct {
 type Link struct {
 	DisplayName string `json:"displayName,omitempty"`
 	URL         string `json:"url,omitempty"`
+	Main        bool   `json:"main,omitempty"`
 }
 
 type Contact struct {
 	DisplayName string   `json:"displayName"`
 	Email       string   `json:"email,omitempty"`
 	Role        []string `json:"role,omitempty"`
+}
+
+// DetailViewExtension describes a provider-owned micro frontend that enriches
+// the provider details view. The extension is rendered in list order.
+type DetailViewExtension struct {
+	// URL is the absolute URL of the micro frontend.
+	URL string `json:"url"`
 }
 
 // ProviderMetadataSpec defines the desired state of ProviderMetadata.
@@ -59,9 +67,16 @@ type ProviderMetadataSpec struct {
 	Documentation []Link                `json:"documentation,omitempty"`
 	Icon          *Icon                 `json:"icon,omitempty"`
 
-	Links                    []Link `json:"links,omitempty"`
-	PreferredSupportChannels []Link `json:"preferredSupportChannels,omitempty"`
-	HelpCenterData           []Link `json:"helpCenterData,omitempty"`
+	// Links are provider-owned links. At most one link may be marked as the
+	// main link via `main: true`.
+	// +kubebuilder:validation:MaxItems=20
+	// +kubebuilder:validation:XValidation:rule="self.filter(l, has(l.main) && l.main).size() <= 1",message="only one link may be marked as main"
+	Links []Link `json:"links,omitempty"`
+
+	PreferredSupportChannels []Link                `json:"preferredSupportChannels,omitempty"`
+	HelpCenterData           []Link                `json:"helpCenterData,omitempty"`
+	DetailViewExtensions     []DetailViewExtension `json:"detailViewExtensions,omitempty"`
+	ServiceLevel             string                `json:"serviceLevel,omitempty"`
 }
 
 // ProviderMetadataStatus defines the observed state of ProviderMetadata.

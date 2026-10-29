@@ -167,6 +167,7 @@ func (s *IndexableResourceWatcherSubroutine) Process(ctx context.Context, instan
 	doc.DefaultFields = extractConfiguredFields(resource, searchIndex.Spec.DefaultFields)
 	doc.SemanticFields = extractStringConfiguredFields(resource, searchIndex.Spec.SemanticFields)
 	doc.FilterableFields = extractFilterableFields(resource, searchIndex.Spec.FilterableFields)
+	doc.SetDefaultFilterableFields()
 
 	accountInfo, err := s.getAccountInfo(ctx, workspacePath, gvk, resource)
 	if err != nil {
@@ -186,6 +187,7 @@ func (s *IndexableResourceWatcherSubroutine) Process(ctx context.Context, instan
 		log.Warn().Msg("AccountInfo is missing required account/organization origin metadata, requeuing")
 		return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 	}
+	doc.FilterableFields["account_fga_object"] = resolveAccountFGAObject(gvk, resourceClusterID, resource.GetName(), accountInfo)
 
 	fgaGroup, fgaKind, fgaClusterID := mapResourceToFGAObject(gvk.Group, gvk.Kind, resourceClusterID, accountInfo)
 	doc.FGAObject = buildFGAObjectName(fgaGroup, fgaKind, fgaClusterID.String(), resource.GetName(), resource.GetNamespace())
@@ -319,8 +321,6 @@ func getSearchIndex(ctx context.Context, orgsClient ctrlruntimeclient.Client, or
 	return searchIndex, nil
 }
 
-// extractConfiguredFields copies the configured dot-notation paths from the
-// unstructured resource object into an output map with the same nested shape.
 func extractConfiguredFields(resource *unstructured.Unstructured, fieldPaths []string) map[string]any {
 	return extractFieldPaths(resource, fieldPaths, nil)
 }
@@ -362,6 +362,7 @@ func extractFieldPaths(
 				continue
 			}
 		}
+		value = sanitizeMapKeys(value)
 		setFieldPath(out, segments, value)
 	}
 
@@ -461,6 +462,30 @@ func opensearchSplitFieldPath(fieldPath string) []string {
 	return segments
 }
 
+// sanitizeMapKeys recursively removes map keys that OpenSearch rejects as field names.
+// OpenSearch rejects keys that are empty or consist only of '.'.
+func sanitizeMapKeys(v any) any {
+	switch val := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(val))
+		for k, child := range val {
+			if strings.Trim(k, ".") == "" {
+				continue
+			}
+			out[k] = sanitizeMapKeys(child)
+		}
+		return out
+	case []any:
+		out := make([]any, len(val))
+		for i, item := range val {
+			out[i] = sanitizeMapKeys(item)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
 func (s *IndexableResourceWatcherSubroutine) generateDocumentID(
 	resource *unstructured.Unstructured,
 	clusterName multicluster.ClusterName,
@@ -495,6 +520,18 @@ func buildPayload(resource *unstructured.Unstructured) (string, string, error) {
 	}
 
 	return string(jsonBytes), string(yamlBytes), nil
+}
+
+// resolveAccountFGAObject returns the FGA object of the Account a document is
+// filtered by. An Account resource lives in its parent's workspace, so the
+// AccountInfo resolved for it describes the parent; it is filtered by the
+// Account it represents instead.
+func resolveAccountFGAObject(gvk schema.GroupVersionKind, resourceClusterID multicluster.ClusterName, resourceName string, accountInfo *pmcorev1alpha1.AccountInfo) string {
+	if gvk.Group == pmcorev1alpha1.GroupName && gvk.Kind == pmsearchv1alpha1.AccountKind {
+		return buildFGAObjectName(pmcorev1alpha1.GroupName, pmsearchv1alpha1.AccountKind, resourceClusterID.String(), resourceName, "")
+	}
+
+	return buildFGAObjectName(pmcorev1alpha1.GroupName, pmsearchv1alpha1.AccountKind, accountInfo.Spec.Account.OriginClusterId, accountInfo.Spec.Account.Name, "")
 }
 
 func mapResourceToFGAObject(group, kind string, clusterID multicluster.ClusterName, accountInfo *pmcorev1alpha1.AccountInfo) (fgaGroup, fgaKind string, fgaClusterID multicluster.ClusterName) {

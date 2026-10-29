@@ -26,11 +26,13 @@ import (
 )
 
 const (
-	CoreProviderName      = "core"
-	SystemProviderName    = "system"
-	ProvidersProviderName = "providers"
-	providerSeparator     = "#"
-	OrgsClusterPath       = "root:orgs"
+	CoreProviderName        = "core"
+	SystemProviderName      = "system"
+	ProvidersProviderName   = "providers"
+	FgaProviderName         = "fga"
+	ProviderFgaProviderName = "provider-fga"
+	providerSeparator       = "#"
+	OrgsClusterPath         = "root:orgs"
 )
 
 type KeycloakConfig struct {
@@ -85,9 +87,11 @@ type IDPConfig struct {
 }
 
 type APIExportEndpointSlices struct {
-	CorePlatformMeshIO      string
-	SystemPlatformMeshIO    string
-	ProvidersPlatformMeshIO string
+	CorePlatformMeshIO        string
+	SystemPlatformMeshIO      string
+	ProvidersPlatformMeshIO   string
+	FgaPlatformMeshIO         string
+	ProviderFgaPlatformMeshIO string
 }
 
 // Config struct to hold the app config
@@ -107,6 +111,7 @@ type Config struct {
 	HttpClientTimeoutSeconds         int
 	SetDefaultPassword               bool
 	AllowMemberTuplesEnabled         bool
+	RekeyOrphanedTuplesEnabled       bool
 	IDP                              IDPConfig
 	Keycloak                         KeycloakConfig
 	Initializer                      InitializerConfig
@@ -126,9 +131,11 @@ func NewConfig() Config {
 			Kubeconfig: "/api-kubeconfig/kubeconfig",
 		},
 		APIExportEndpointSlices: APIExportEndpointSlices{
-			CorePlatformMeshIO:      "core.platform-mesh.io",
-			SystemPlatformMeshIO:    "system.platform-mesh.io",
-			ProvidersPlatformMeshIO: "providers.platform-mesh.io",
+			CorePlatformMeshIO:        "core.platform-mesh.io",
+			SystemPlatformMeshIO:      "system.platform-mesh.io",
+			ProvidersPlatformMeshIO:   "providers.platform-mesh.io",
+			FgaPlatformMeshIO:         "fga.platform-mesh.io",
+			ProviderFgaPlatformMeshIO: "provider-fga.platform-mesh.io",
 		},
 		BaseDomain:               "portal.dev.local:8443",
 		GroupClaim:               "groups",
@@ -167,6 +174,8 @@ func (c *Config) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&c.APIExportEndpointSlices.CorePlatformMeshIO, "api-export-endpoint-slice-name", c.APIExportEndpointSlices.CorePlatformMeshIO, "Set the core.platform-mesh.io APIExportEndpointSlice name")
 	fs.StringVar(&c.APIExportEndpointSlices.SystemPlatformMeshIO, "system-api-export-endpoint-slice-name", c.APIExportEndpointSlices.SystemPlatformMeshIO, "Set the system.platform-mesh.io APIExportEndpointSlice name")
 	fs.StringVar(&c.APIExportEndpointSlices.ProvidersPlatformMeshIO, "providers-api-export-endpoint-slice-name", c.APIExportEndpointSlices.ProvidersPlatformMeshIO, "Set the providers.platform-mesh.io APIExportEndpointSlice name")
+	fs.StringVar(&c.APIExportEndpointSlices.FgaPlatformMeshIO, "fga-api-export-endpoint-slice-name", c.APIExportEndpointSlices.FgaPlatformMeshIO, "Set the fga.platform-mesh.io APIExportEndpointSlice name")
+	fs.StringVar(&c.APIExportEndpointSlices.ProviderFgaPlatformMeshIO, "provider-fga-api-export-endpoint-slice-name", c.APIExportEndpointSlices.ProviderFgaPlatformMeshIO, "Set the provider-fga.platform-mesh.io APIExportEndpointSlice name")
 	fs.StringVar(&c.CoreModulePath, "core-module-path", c.CoreModulePath, "Set the path to the core module FGA model file")
 	fs.StringVar(&c.BaseDomain, "base-domain", c.BaseDomain, "Set the base domain used to construct issuer URLs")
 	fs.StringVar(&c.GroupClaim, "group-claim", c.GroupClaim, "Set the ID token group claim")
@@ -179,6 +188,7 @@ func (c *Config) AddFlags(fs *pflag.FlagSet) {
 	fs.IntVar(&c.HttpClientTimeoutSeconds, "http-client-timeout-seconds", c.HttpClientTimeoutSeconds, "Set HTTP client timeout in seconds")
 	fs.BoolVar(&c.SetDefaultPassword, "set-default-password", c.SetDefaultPassword, "Enable setting default password for identity provider users")
 	fs.BoolVar(&c.AllowMemberTuplesEnabled, "allow-member-tuples-enabled", c.AllowMemberTuplesEnabled, "Enable allow-member tuples management")
+	fs.BoolVar(&c.RekeyOrphanedTuplesEnabled, "rekey-orphaned-tuples-enabled", c.RekeyOrphanedTuplesEnabled, "Enable re-keying of org tuples orphaned by a workspace re-creation (cluster-id change)")
 	fs.StringSliceVar(&c.IDP.RealmDenyList, "idp-realm-deny-list", c.IDP.RealmDenyList, "Comma-separated list of Keycloak realms to ignore")
 	fs.StringVar(&c.IDP.SMTPServer, "idp-smtp-server", c.IDP.SMTPServer, "Set Keycloak SMTP server host")
 	fs.IntVar(&c.IDP.SMTPPort, "idp-smtp-port", c.IDP.SMTPPort, "Set Keycloak SMTP server port")
@@ -215,4 +225,9 @@ func (c Config) TerminatorName() string {
 // The multi.Provider prefixes cluster names as "providerName#clusterName"
 func MultiProviderName(providerName, clusterName string) multicluster.ClusterName {
 	return multicluster.ClusterName(providerName + providerSeparator + clusterName)
+}
+
+// StoreClusterName returns the cluster name of a Store's logical cluster, as seen through the fga provider.
+func StoreClusterName(logicalCluster string) multicluster.ClusterName {
+	return MultiProviderName(FgaProviderName, logicalCluster)
 }

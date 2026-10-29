@@ -17,6 +17,7 @@ limitations under the License.
 package cmd
 
 import (
+	"context"
 	"crypto/tls"
 	"net/http"
 
@@ -31,6 +32,7 @@ import (
 	"go.platform-mesh.io/rebac-authz-webhook/pkg/authorization/union"
 	"go.platform-mesh.io/rebac-authz-webhook/pkg/clustercache"
 	"go.platform-mesh.io/rebac-authz-webhook/pkg/config"
+	"go.platform-mesh.io/rebac-authz-webhook/pkg/handler/batch"
 	"go.platform-mesh.io/rebac-authz-webhook/pkg/handler/contextual"
 	"go.platform-mesh.io/rebac-authz-webhook/pkg/handler/nonresourceattributes"
 	"go.platform-mesh.io/rebac-authz-webhook/pkg/handler/orgs"
@@ -39,6 +41,7 @@ import (
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
@@ -96,7 +99,21 @@ func NewServeCmd() *cobra.Command {
 				klog.Exit(err, "unable to set up overall controller manager")
 			}
 
-			clusterCache, err := clustercache.New(mgr)
+			klog.InfoS("using store endpoint slice name", "name", serverCfg.StoreAPIExportEndpointSliceName)
+			storeProvider, err := pathaware.New(restCfg, serverCfg.StoreAPIExportEndpointSliceName, apiexport.Options{
+				Scheme: scheme,
+			})
+			if err != nil {
+				klog.Exit(err, "unable to construct store cluster provider")
+			}
+			// Only used to read Stores, so no Aware engages its clusters.
+			if err := mgr.GetLocalManager().Add(manager.RunnableFunc(func(ctx context.Context) error {
+				return storeProvider.Start(ctx, nil)
+			})); err != nil {
+				klog.Exit(err, "unable to register store cluster provider")
+			}
+
+			clusterCache, err := clustercache.New(mgr, clustercache.WithStoreClusters(storeProvider))
 			if err != nil {
 				klog.Exit(err, "failed to create cluster cache")
 			}
@@ -131,6 +148,14 @@ func NewServeCmd() *cobra.Command {
 					contextual.New(fga, clusterCache, extraAttrClusterKey, cacheMissTracker, serverCfg.Webhook.CacheMissRetryAfter),
 				),
 			))
+
+			batchHandler := batch.New(
+				klog.NewKlogr(),
+				fga,
+				clusterCache,
+				serverCfg.Webhook.ClusterPathKey,
+			)
+			mgr.GetWebhookServer().Register("/batch-authz", batchHandler)
 
 			if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 				klog.Exit(err, "unable to set up health check")
