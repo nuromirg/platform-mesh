@@ -19,8 +19,6 @@ package subroutine
 import (
 	"context"
 	"fmt"
-
-	"slices"
 	"strings"
 
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"

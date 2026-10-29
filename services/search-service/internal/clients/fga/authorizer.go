@@ -23,9 +23,9 @@ import (
 	"strings"
 
 	openfgav1 "github.com/openfga/api/proto/openfga/v1"
-	"google.golang.org/protobuf/types/known/wrapperspb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"go.platform-mesh.io/golang-commons/logger"
 	"go.platform-mesh.io/search-service/internal/config"
@@ -36,6 +36,7 @@ const (
 	batchCheckChunkSize = 100
 	listStoresPageSize  = 100
 )
+
 type client interface {
 	BatchCheck(context.Context, *openfgav1.BatchCheckRequest, ...grpc.CallOption) (*openfgav1.BatchCheckResponse, error)
 	ListObjects(context.Context, *openfgav1.ListObjectsRequest, ...grpc.CallOption) (*openfgav1.ListObjectsResponse, error)
